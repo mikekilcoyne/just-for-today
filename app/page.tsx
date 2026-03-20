@@ -44,6 +44,8 @@ interface DayData {
   movedForward: string;
   done: Record<string, boolean>;
   sectionTitles: Record<string, string>;
+  weekendVibes: string;
+  weekendLinks: string;
   composeEmail: ComposeEmailDraft;
   promptBuilder: PromptBuilder;
   tomorrowBriefing?: TomorrowBriefing;
@@ -56,6 +58,8 @@ const EMPTY: DayData = {
   projectLink: "", howItFelt: "", midDayFeeling: "", movedForward: "",
   done: {},
   sectionTitles: {},
+  weekendVibes: "",
+  weekendLinks: "",
   composeEmail: { to: "", subject: "", notes: "", draft: "" },
   promptBuilder: { brief: "", prompt: "" },
 };
@@ -405,6 +409,31 @@ function DoneToggle({ sectionKey, done, onToggle }: { sectionKey: string; done: 
   );
 }
 
+// ─── Event reminder helpers ───────────────────────────────────────────────────
+
+function parseEventStart(timeStr: string): Date | null {
+  const match = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+  if (!match) return null;
+  let h = parseInt(match[1]);
+  const m = parseInt(match[2]);
+  const ap = match[3]?.toUpperCase();
+  if (ap === "PM" && h !== 12) h += 12;
+  if (ap === "AM" && h === 12) h = 0;
+  const d = new Date(); d.setHours(h, m, 0, 0);
+  return d;
+}
+
+function eventPrepHint(block: ScheduleBlock): string {
+  const t = (block.task + " " + block.note).toLowerCase();
+  if (t.includes("zoom") || t.includes("meet") || t.includes("call") || t.includes("interview"))
+    return "Get your notes open and grab the link.";
+  if (t.includes("drive") || t.includes("travel") || t.includes("commute") || t.includes("appointment"))
+    return "Leave time to get there — check traffic now.";
+  if (t.includes("email") || t.includes("send") || t.includes("follow"))
+    return "Prep anything you need to send before this.";
+  return "Give yourself 5 minutes to focus before this one.";
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -434,6 +463,8 @@ export default function Home() {
   const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false);
   const [streak, setStreak] = useState(0);
   const [activeSectionId, setActiveSectionId] = useState("");
+  const [upcomingEvent, setUpcomingEvent] = useState<{ block: ScheduleBlock; minsUntil: number } | null>(null);
+  const [dayOfWeek, setDayOfWeek] = useState(0); // 0=Sun, 6=Sat
   const [breakSeconds, setBreakSeconds] = useState(0);
   const breakCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [shareText, setShareText] = useState("");
@@ -458,6 +489,7 @@ export default function Home() {
     setStorageKey(todayKey);
     const h = d.getHours();
     setIsMidDay(h >= 11 && h < 14);
+    setDayOfWeek(d.getDay());
     // Load yesterday's wins
     const yest = new Date(d); yest.setDate(yest.getDate() - 1);
     const yesterKey = `jft-${yest.toISOString().slice(0, 10)}`;
@@ -526,6 +558,28 @@ export default function Home() {
     }
     return () => { if (breakCountdownRef.current) clearInterval(breakCountdownRef.current); };
   }, [showBreak]);
+
+  // Event reminder — checks schedule every minute for upcoming blocks
+  useEffect(() => {
+    if (!data.schedule.length) { setUpcomingEvent(null); return; }
+    const check = () => {
+      const now = new Date();
+      // Find the most imminent upcoming event (within 35 min)
+      let soonest: { block: ScheduleBlock; minsUntil: number } | null = null;
+      for (const block of data.schedule) {
+        const start = parseEventStart(block.time);
+        if (!start) continue;
+        const mins = (start.getTime() - now.getTime()) / 60000;
+        if (mins > 0 && mins <= 35) {
+          if (!soonest || mins < soonest.minsUntil) soonest = { block, minsUntil: Math.round(mins) };
+        }
+      }
+      setUpcomingEvent(soonest);
+    };
+    check();
+    const iv = setInterval(check, 60000);
+    return () => clearInterval(iv);
+  }, [data.schedule]);
 
   // ─── Section nav ────────────────────────────────────────────────────────────
   // Stable dep key — only recalculate when visible sections change
@@ -1029,6 +1083,24 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Upcoming event reminder */}
+        {upcomingEvent && (
+          <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-6 py-4 flex items-start gap-4">
+            <span className="text-2xl shrink-0">⏰</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-semibold uppercase tracking-widest text-amber-600 mb-1">
+                In {upcomingEvent.minsUntil} minute{upcomingEvent.minsUntil !== 1 ? "s" : ""}
+              </p>
+              <p className="text-sm font-semibold text-stone-800">{upcomingEvent.block.task}</p>
+              {upcomingEvent.block.note && (
+                <p className="text-xs text-stone-500 mt-0.5">{upcomingEvent.block.note}</p>
+              )}
+              <p className="text-xs text-amber-700 mt-2">{eventPrepHint(upcomingEvent.block)}</p>
+            </div>
+            <button onClick={() => setUpcomingEvent(null)} className="text-stone-300 hover:text-stone-500 text-xs shrink-0">✕</button>
+          </div>
+        )}
+
         {/* Yesterday's wins banner */}
         {yesterday && !data.brainDump && (
           <Card id="sec-yesterday" className="mb-6 border-stone-200 bg-gradient-to-br from-stone-50 to-amber-50">
@@ -1531,6 +1603,45 @@ export default function Home() {
                 </div>
               </div>
             )}
+          </Card>
+        )}
+
+        {/* Weekend Mode */}
+        {(dayOfWeek === 6 || dayOfWeek === 0) && (
+          <Card className="mb-6 border-stone-200 bg-gradient-to-br from-stone-50 to-sky-50">
+            <SectionTitle
+              sectionKey="weekend"
+              defaultTitle={dayOfWeek === 6 ? "Catching Up on the Week" : "Plan the Week, then Chill"}
+              sectionTitles={data.sectionTitles} onSave={saveSectionTitle}
+            />
+            <SectionLabel>{dayOfWeek === 6 ? "Light Chore Mode — Saturday" : "Wind down and look ahead — Sunday"}</SectionLabel>
+            <p className="text-sm text-stone-500 mb-4 mt-2">
+              {dayOfWeek === 6
+                ? "What loose ends from the week do you want to tie up today?"
+                : "What do you want to feel good about going into Monday?"}
+            </p>
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-stone-500 mb-1.5">
+                What restorative things are you getting into this weekend? 🌿
+              </label>
+              <textarea
+                className="w-full rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 placeholder-stone-300 focus:outline-none focus:ring-2 focus:ring-stone-200 transition resize-none"
+                rows={3}
+                placeholder="Hiking, reading, cooking, a movie... what sounds good?"
+                value={data.weekendVibes}
+                onChange={(e) => update("weekendVibes")(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-stone-500 mb-1.5">Links to look forward to</label>
+              <textarea
+                className="w-full rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 placeholder-stone-300 focus:outline-none focus:ring-2 focus:ring-stone-200 transition resize-none"
+                rows={3}
+                placeholder="Podcast, show, book, event... paste links or just name them"
+                value={data.weekendLinks}
+                onChange={(e) => update("weekendLinks")(e.target.value)}
+              />
+            </div>
           </Card>
         )}
 
