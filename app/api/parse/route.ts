@@ -55,6 +55,111 @@ function asString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
+function extractActionLines(brainDump: string) {
+  return brainDump
+    .split("\n")
+    .map((line) => line.replace(/^[•\-*\d.)\s]+/, "").trim())
+    .filter((line) => line.length > 2);
+}
+
+function parseClockToMinutes(value: string) {
+  const match = value.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (!match) return null;
+  let hours = Number(match[1]);
+  const minutes = Number(match[2] ?? "0");
+  const meridiem = match[3]?.toUpperCase();
+  if (meridiem === "PM" && hours !== 12) hours += 12;
+  if (meridiem === "AM" && hours === 12) hours = 0;
+  if (!meridiem && hours < 7) hours += 12;
+  return hours * 60 + minutes;
+}
+
+function formatMinutesAsTime(totalMinutes: number) {
+  const dayMinutes = ((totalMinutes % (24 * 60)) + 24 * 60) % (24 * 60);
+  const hours24 = Math.floor(dayMinutes / 60);
+  const minutes = dayMinutes % 60;
+  const suffix = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 || 12;
+  return `${hours12}:${String(minutes).padStart(2, "0")} ${suffix}`;
+}
+
+function buildRoughSchedule(brainDump: string, currentTime: string, fixedEvents: { time: string; task: string; note: string }[]) {
+  const fixedTaskKeys = new Set(fixedEvents.map((event) => event.task.trim().toLowerCase()));
+  const actionLines = Array.from(new Set(extractActionLines(brainDump)))
+    .filter((line) => !fixedTaskKeys.has(line.toLowerCase()))
+    .slice(0, 5);
+
+  if (!actionLines.length) return fixedEvents;
+
+  const occupiedMinutes = fixedEvents
+    .map((event) => parseClockToMinutes(event.time))
+    .filter((value): value is number => value !== null);
+  const roundedNow = (() => {
+    const parsed = parseClockToMinutes(currentTime);
+    if (parsed === null) return 9 * 60;
+    const rounded = Math.ceil(parsed / 30) * 30;
+    return Math.max(rounded, 8 * 60 + 30);
+  })();
+
+  let cursor = roundedNow;
+  const generated = actionLines.map((task, index) => {
+    if (index > 0) cursor += 90;
+    while (occupiedMinutes.some((minute) => Math.abs(minute - cursor) < 50)) {
+      cursor += 30;
+    }
+    occupiedMinutes.push(cursor);
+    return {
+      time: formatMinutesAsTime(cursor),
+      task,
+      note: "",
+    };
+  });
+
+  return [...fixedEvents, ...generated].sort((a, b) => {
+    const aMinutes = parseClockToMinutes(a.time) ?? 0;
+    const bMinutes = parseClockToMinutes(b.time) ?? 0;
+    return aMinutes - bMinutes;
+  });
+}
+
+function buildFallbackPlan(brainDump: string, currentTime: string, fixedEvents: { time: string; task: string; note: string }[]) {
+  const lines = Array.from(new Set(extractActionLines(brainDump)));
+  const topPriority = lines[0] ?? "";
+  const secondaryMoves = lines.slice(1, 4).join("\n");
+  const niceToHaves = lines.slice(4, 7).join("\n");
+  const projectCandidate = lines.find((line) => /\b(build|update|launch|plan|site|page|deck|proposal|prep|write|design)\b/i.test(line)) ?? "";
+
+  return {
+    topPriority,
+    secondaryMoves,
+    niceToHaves,
+    projectPlan: projectCandidate
+      ? [
+          `• Start with: ${projectCandidate}`,
+          ...lines
+            .filter((line) => line !== topPriority && line !== projectCandidate)
+            .slice(0, 2)
+            .map((line) => `• Then: ${line}`),
+        ].join("\n")
+      : "",
+    schedule: buildRoughSchedule(brainDump, currentTime, fixedEvents),
+    texts: [],
+    emails: [],
+    interviewGameplan: "",
+  };
+}
+
+function parseModelJson(text: string) {
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const jsonMatch = trimmed.match(/```json\s*([\s\S]*?)```/) || trimmed.match(/(\{[\s\S]*\})/);
+    if (!jsonMatch) throw new Error("Model did not return JSON");
+    return JSON.parse(jsonMatch[1]);
+  }
+}
+
 function normalizeArray<T>(value: unknown, mapItem: (item: unknown) => T | null) {
   if (Array.isArray(value)) return value.map(mapItem).filter((item): item is T => item !== null);
   const single = mapItem(value);
@@ -113,7 +218,7 @@ async function parseWithOllama(brainDump: string, currentTime: string, fixedEven
 
   if (!res.ok) throw new Error(`Ollama error: ${res.status}`);
   const data = await res.json();
-  return JSON.parse(data.choices[0].message.content);
+  return parseModelJson(data.choices[0].message.content ?? "{}");
 }
 
 async function parseWithAnthropic(brainDump: string, currentTime: string, fixedEvents: { time: string; task: string; note: string }[]) {
@@ -126,9 +231,7 @@ async function parseWithAnthropic(brainDump: string, currentTime: string, fixedE
   });
 
   const text = response.content[0].type === "text" ? response.content[0].text : "{}";
-  // Extract JSON from response (model may wrap it in ```json ... ```)
-  const jsonMatch = text.match(/```json\s*([\s\S]*?)```/) || text.match(/(\{[\s\S]*\})/);
-  return JSON.parse(jsonMatch ? jsonMatch[1] : text);
+  return parseModelJson(text);
 }
 
 export async function POST(req: Request) {
@@ -141,9 +244,23 @@ export async function POST(req: Request) {
   const useOllama =
     process.env.USE_OLLAMA === "true" || !process.env.ANTHROPIC_API_KEY;
 
-  const result = useOllama
-    ? await parseWithOllama(brainDump, currentTime, fixedEvents)
-    : await parseWithAnthropic(brainDump, currentTime, fixedEvents);
+  try {
+    const result = useOllama
+      ? await parseWithOllama(brainDump, currentTime, fixedEvents)
+      : await parseWithAnthropic(brainDump, currentTime, fixedEvents);
+    const normalized = normalizeParseResult(result);
+    const roughSchedule = buildRoughSchedule(brainDump, currentTime, fixedEvents);
+    const fixedTaskKeys = new Set(
+      fixedEvents.map((event: { time: string; task: string; note: string }) => event.task.trim().toLowerCase())
+    );
+    const hasPlannedWorkBlocks = normalized.schedule.some((block) => !fixedTaskKeys.has(block.task.trim().toLowerCase()));
 
-  return NextResponse.json(normalizeParseResult(result));
+    return NextResponse.json({
+      ...normalized,
+      schedule: hasPlannedWorkBlocks || roughSchedule.length === 0 ? normalized.schedule : roughSchedule,
+    });
+  } catch (error) {
+    console.error("parse route fallback", error);
+    return NextResponse.json(normalizeParseResult(buildFallbackPlan(brainDump, currentTime, fixedEvents)));
+  }
 }
