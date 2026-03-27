@@ -1362,12 +1362,7 @@ function SyncIndicator({
     setTimeout(() => setCopied(false), 1500)
   }
 
-  const dot =
-    status === "syncing" ? "🔄" :
-    status === "synced"  ? "·" :
-    status === "error"   ? "!" : "·"
-
-  const dotColor =
+  const cloudColor =
     status === "syncing" ? "var(--text-muted)" :
     status === "synced"  ? "#047857" :
     status === "error"   ? "#dc2626" : "var(--text-muted)"
@@ -1376,11 +1371,12 @@ function SyncIndicator({
     <div ref={ref} style={{ position: "relative" }}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="text-xs px-1.5 py-0.5 rounded"
-        style={{ color: dotColor, opacity: 0.7 }}
+        className="flex items-center gap-1 text-xs px-2 py-1 rounded-full border"
+        style={{ color: cloudColor, borderColor: cloudColor, opacity: 0.85 }}
         title="Sync"
       >
-        {dot === "🔄" ? <span style={{ fontSize: "0.65rem" }}>↻</span> : dot}
+        <span style={{ fontSize: "0.75rem" }}>☁</span>
+        <span>{status === "syncing" ? "Syncing…" : status === "error" ? "Sync error" : "Cloud"}</span>
       </button>
 
       {open && (
