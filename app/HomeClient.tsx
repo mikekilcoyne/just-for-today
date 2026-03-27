@@ -468,6 +468,16 @@ export default function HomeClient() {
                     })
                     .catch(() => setSyncStatus("error"))
                 }}
+                onPushAll={() => {
+                  if (!syncToken) return
+                  setSyncStatus("syncing")
+                  const keys = Object.keys(localStorage).filter((k) => k.startsWith("jft2-"))
+                  const days = keys.map((k) => JSON.parse(localStorage.getItem(k)!))
+                  Promise.all(days.map((d) => pushDay(syncToken, d)))
+                    .then(() => pushMeta(syncToken, meta))
+                    .then(() => setSyncStatus("synced"))
+                    .catch(() => setSyncStatus("error"))
+                }}
               />
             )}
           </div>
@@ -1325,10 +1335,12 @@ function SyncIndicator({
   status,
   token,
   onChangeToken,
+  onPushAll,
 }: {
   status: "idle" | "syncing" | "synced" | "error"
   token: string
   onChangeToken: (t: string) => void
+  onPushAll: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [tokenInput, setTokenInput] = useState("")
@@ -1405,6 +1417,14 @@ function SyncIndicator({
               {copied ? "Copied!" : "Copy"}
             </button>
           </div>
+
+          <button
+            onClick={() => { onPushAll(); setOpen(false) }}
+            className="text-xs w-full text-left mb-4"
+            style={{ color: "#0369a1" }}
+          >
+            Push local data to cloud ↑
+          </button>
 
           <p className="text-xs mb-1.5" style={{ color: "var(--text-muted)" }}>
             Use on another device:
