@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react"
 import confetti from "canvas-confetti"
+import { pushDay, pushMeta, pullAll } from "@/lib/sync"
 
 function fireBalloons() {
   const colors = ["#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff", "#ff922b", "#cc5de8", "#f06595"]
@@ -30,6 +31,8 @@ interface Item {
   status: "active" | "done"
   created_at: string
   type?: "event" // calendar events parsed from day headers
+  notes?: string
+  links?: string[]
 }
 
 interface DayData {
@@ -164,6 +167,14 @@ function computeStreak(meta: AppMeta, today: string): AppMeta {
 
 // ─── Parse Brain Dump ─────────────────────────────────────────────────────────
 
+function isIntentionPhrase(text: string): boolean {
+  return (
+    /^(today[,\s]+)?i\s+(want|need|would like|hope|plan|intend)\s+to\b/i.test(text) ||
+    /^(today[,\s]*)?i['']?m\s+(going to|planning to|hoping to)\b/i.test(text) ||
+    /^(my\s+)?goals?\s*(for\s+today)?\s*:/i.test(text)
+  )
+}
+
 // Parses brain dump text. Lines under a day header (e.g. "Monday") become
 // events assigned to that day. Everything else goes to anchorDate as tasks.
 function parseBrainDump(text: string, anchorDate: string): {
@@ -191,6 +202,7 @@ function parseBrainDump(text: string, anchorDate: string): {
 
     const itemText = stripBullet(trimmed)
     if (itemText.length < 2) continue
+    if (!currentDay && isIntentionPhrase(itemText)) continue
 
     const item: Item = {
       id: crypto.randomUUID(),
@@ -222,10 +234,48 @@ export default function HomeClient() {
   const [dayData, setDayData] = useState<DayData | null>(null)
   const [meta, setMeta] = useState<AppMeta>({ current_streak: 0, last_active_date: null })
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [syncToken, setSyncToken] = useState<string | null>(null)
+  const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "synced" | "error">("idle")
 
   // Load meta once
   useEffect(() => {
     setMeta(loadMeta())
+  }, [])
+
+  // Init sync token + pull remote data on mount
+  useEffect(() => {
+    const stored = localStorage.getItem("jft-sync-token")
+    const token = stored ?? crypto.randomUUID()
+    if (!stored) localStorage.setItem("jft-sync-token", token)
+    setSyncToken(token)
+    setSyncStatus("syncing")
+
+    pullAll(token)
+      .then(({ days, meta: remoteMeta }) => {
+        days.forEach((remote) => {
+          const local = loadDay(remote.date)
+          if (!local || (remote.items as unknown[]).length >= local.items.length) {
+            localStorage.setItem(`jft2-${remote.date}`, JSON.stringify(remote))
+          }
+        })
+        if (remoteMeta) {
+          const localMeta = loadMeta()
+          if (remoteMeta.current_streak >= localMeta.current_streak) {
+            saveMeta(remoteMeta)
+            setMeta(remoteMeta)
+          }
+        }
+        // Reload current day in case remote data changed it
+        const fresh = loadDay(getTodayStr())
+        if (fresh) {
+          setDayData(fresh)
+          setRawDump(fresh.brain_dump)
+          setView("triage")
+        }
+        setSyncStatus("synced")
+      })
+      .catch(() => setSyncStatus("error"))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Load data for selected date
@@ -273,6 +323,7 @@ export default function HomeClient() {
     const updated = { ...dayData, items }
     setDayData(updated)
     saveDay(updated)
+    if (syncToken) pushDay(syncToken, updated).catch(console.error)
   }
 
   function setPriority(id: string, priority: Priority) {
@@ -292,6 +343,7 @@ export default function HomeClient() {
       if (newMeta !== meta) {
         setMeta(newMeta)
         saveMeta(newMeta)
+        if (syncToken) pushMeta(syncToken, newMeta).catch(console.error)
       }
     }
   }
@@ -305,6 +357,13 @@ export default function HomeClient() {
     if (!dayData) return
     mutateItems(dayData.items.filter((i) => i.id !== id))
   }
+
+  function updateItemDetail(id: string, notes: string, links: string[]) {
+    if (!dayData) return
+    mutateItems(dayData.items.map((i) => (i.id === id ? { ...i, notes, links } : i)))
+  }
+
+  const [focusedItemId, setFocusedItemId] = useState<string | null>(null)
 
   function addItem() {
     if (!dayData) return
@@ -334,6 +393,9 @@ export default function HomeClient() {
     )
     .slice(0, 5)
 
+  const weekItems = dayData?.items.filter((i) => i.priority === "week" && i.status === "active") ?? []
+  const laterItems = dayData?.items.filter((i) => i.priority === "later" && i.status === "active") ?? []
+
   return (
     <div className="min-h-screen" style={{ background: "var(--background)" }}>
       {/* ── Header ── */}
@@ -345,17 +407,38 @@ export default function HomeClient() {
           backdropFilter: "blur(10px)",
         }}
       >
-        <div className="max-w-2xl mx-auto px-6 py-4 flex items-center justify-between">
-          <span
-            className="text-xs font-bold tracking-widest uppercase"
-            style={{ color: "var(--text-muted)" }}
-          >
-            Just for Today
-          </span>
+        <div className="max-w-2xl mx-auto px-6 py-4 flex items-center">
+          {/* Left: brand + This Week */}
+          <div className="flex items-center gap-3 flex-1">
+            <span
+              className="text-xs font-bold tracking-widest uppercase"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Just for Today
+            </span>
+            {weekItems.length > 0 && (
+              <QueueDropdown
+                label="This Week"
+                items={weekItems}
+                onPromote={(id: string) => setPriority(id, "today")}
+              />
+            )}
+          </div>
+
+          {/* Center: date */}
           <span className="text-sm" style={{ color: "var(--text-muted)" }}>
             {formatDisplayDate(selectedDate)}
           </span>
-          <div className="w-12 flex justify-end">
+
+          {/* Right: Later + streak + sync */}
+          <div className="flex items-center gap-2 flex-1 justify-end">
+            {laterItems.length > 0 && (
+              <QueueDropdown
+                label="Later"
+                items={laterItems}
+                onPromote={(id: string) => setPriority(id, "today")}
+              />
+            )}
             {meta.current_streak > 0 && (
               <span
                 className="text-xs font-bold tabular-nums"
@@ -364,6 +447,28 @@ export default function HomeClient() {
               >
                 {meta.current_streak}d
               </span>
+            )}
+            {syncToken && (
+              <SyncIndicator
+                status={syncStatus}
+                token={syncToken}
+                onChangeToken={(t) => {
+                  localStorage.setItem("jft-sync-token", t)
+                  setSyncToken(t)
+                  setSyncStatus("syncing")
+                  pullAll(t)
+                    .then(({ days, meta: remoteMeta }) => {
+                      days.forEach((remote) => {
+                        localStorage.setItem(`jft2-${remote.date}`, JSON.stringify(remote))
+                      })
+                      if (remoteMeta) { saveMeta(remoteMeta); setMeta(remoteMeta) }
+                      const fresh = loadDay(selectedDate)
+                      if (fresh) { setDayData(fresh); setRawDump(fresh.brain_dump); setView("triage") }
+                      setSyncStatus("synced")
+                    })
+                    .catch(() => setSyncStatus("error"))
+                }}
+              />
             )}
           </div>
         </div>
@@ -387,8 +492,20 @@ export default function HomeClient() {
           />
         )}
 
+        {/* ── Focus Mode ── */}
+        {view === "triage" && dayData && focusedItemId && (() => {
+          const focusedItem = dayData.items.find((i) => i.id === focusedItemId)
+          return focusedItem ? (
+            <FocusView
+              item={focusedItem}
+              onToggleDone={(id) => { toggleDone(id); setTimeout(() => setFocusedItemId(null), 1200) }}
+              onExit={() => setFocusedItemId(null)}
+            />
+          ) : null
+        })()}
+
         {/* ── Triage ── */}
-        {view === "triage" && dayData && (
+        {view === "triage" && dayData && !focusedItemId && (
           <>
             <TriageView
               items={dayData.items}
@@ -401,6 +518,8 @@ export default function HomeClient() {
               onAdd={addItem}
               onEditingIdChange={setEditingId}
               onReDump={() => setView("dump")}
+              onUpdateDetail={updateItemDetail}
+              onFocus={setFocusedItemId}
             />
             {(recentlyDone.length > 0 || stillActive.length > 0) && (
               <ContextPanel done={recentlyDone} active={stillActive} />
@@ -598,6 +717,8 @@ function TriageView({
   onAdd,
   onEditingIdChange,
   onReDump,
+  onUpdateDetail,
+  onFocus,
 }: {
   items: Item[]
   editingId: string | null
@@ -609,7 +730,10 @@ function TriageView({
   onAdd: () => void
   onEditingIdChange: (id: string | null) => void
   onReDump: () => void
+  onUpdateDetail: (id: string, notes: string, links: string[]) => void
+  onFocus: (id: string) => void
 }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const events = items.filter((i) => i.type === "event")
   const tasks = items.filter((i) => i.type !== "event")
 
@@ -680,12 +804,16 @@ function TriageView({
               key={item.id}
               item={item}
               isEditing={editingId === item.id}
+              isExpanded={expandedId === item.id}
               onSetPriority={onSetPriority}
               onToggleDone={onToggleDone}
               onEditText={onEditText}
               onDelete={onDelete}
               onStartEdit={() => onEditingIdChange(item.id)}
               onStopEdit={() => onEditingIdChange(null)}
+              onExpandToggle={() => setExpandedId((prev) => (prev === item.id ? null : item.id))}
+              onUpdateDetail={(notes, links) => onUpdateDetail(item.id, notes, links)}
+              onFocus={() => onFocus(item.id)}
             />
           ))}
         </div>
@@ -707,12 +835,16 @@ function TriageView({
               key={item.id}
               item={item}
               isEditing={editingId === item.id}
+              isExpanded={expandedId === item.id}
               onSetPriority={onSetPriority}
               onToggleDone={onToggleDone}
               onEditText={onEditText}
               onDelete={onDelete}
               onStartEdit={() => onEditingIdChange(item.id)}
               onStopEdit={() => onEditingIdChange(null)}
+              onExpandToggle={() => setExpandedId((prev) => (prev === item.id ? null : item.id))}
+              onUpdateDetail={(notes: string, links: string[]) => onUpdateDetail(item.id, notes, links)}
+              onFocus={() => onFocus(item.id)}
             />
           ))}
         </div>
@@ -738,23 +870,32 @@ const PILL_ACTIVE: Record<string, string> = {
 function ItemCard({
   item,
   isEditing,
+  isExpanded,
   onSetPriority,
   onToggleDone,
   onEditText,
   onDelete,
   onStartEdit,
   onStopEdit,
+  onExpandToggle,
+  onUpdateDetail,
+  onFocus,
 }: {
   item: Item
   isEditing: boolean
+  isExpanded: boolean
   onSetPriority: (id: string, p: Priority) => void
   onToggleDone: (id: string) => void
   onEditText: (id: string, text: string) => void
   onDelete: (id: string) => void
   onStartEdit: () => void
   onStopEdit: () => void
+  onExpandToggle: () => void
+  onUpdateDetail: (notes: string, links: string[]) => void
+  onFocus: () => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const [linkInput, setLinkInput] = useState("")
   const isDone = item.status === "done"
 
   useEffect(() => {
@@ -767,6 +908,7 @@ function ItemCard({
   }, [isEditing])
 
   const isEvent = item.type === "event"
+  const hasDetail = !!(item.notes || (item.links && item.links.length > 0))
 
   return (
     <div
@@ -830,6 +972,19 @@ function ItemCard({
           )}
         </div>
 
+        {/* Focus */}
+        {!isDone && item.type !== "event" && (
+          <button
+            onClick={onFocus}
+            className="flex-shrink-0 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity text-xs leading-none"
+            style={{ color: "var(--text-muted)", marginTop: "2px" }}
+            aria-label="Focus mode"
+            title="Focus"
+          >
+            ◎
+          </button>
+        )}
+
         {/* Delete */}
         <button
           onClick={() => onDelete(item.id)}
@@ -841,9 +996,9 @@ function ItemCard({
         </button>
       </div>
 
-      {/* Priority pills — tasks only, hidden when done */}
+      {/* Priority pills + expand toggle — tasks only, hidden when done */}
       {!isDone && item.type !== "event" && (
-        <div className="flex gap-2 mt-3 pl-9">
+        <div className="flex items-center gap-2 mt-3 pl-9">
           {(["today", "week", "later"] as const).map((p) => {
             const isActive = item.priority === p
             return (
@@ -857,6 +1012,73 @@ function ItemCard({
               </button>
             )
           })}
+          <button
+            onClick={onExpandToggle}
+            className="ml-auto text-xs"
+            style={{ color: "var(--text-muted)", opacity: hasDetail ? 0.8 : 0.35 }}
+          >
+            {isExpanded ? "▾ notes" : hasDetail ? "▸ notes ·" : "▸ notes"}
+          </button>
+        </div>
+      )}
+
+      {/* Expanded detail panel */}
+      {isExpanded && !isDone && (
+        <div className="mt-3 pl-9 space-y-3">
+          <textarea
+            value={item.notes ?? ""}
+            onChange={(e) => onUpdateDetail(e.target.value, item.links ?? [])}
+            placeholder="notes..."
+            className="w-full text-xs resize-none outline-none rounded-lg"
+            style={{
+              minHeight: "60px",
+              background: "rgba(0,0,0,0.03)",
+              border: "1px solid var(--surface-border)",
+              padding: "8px 10px",
+              color: "var(--foreground)",
+            }}
+          />
+          <div>
+            {(item.links ?? []).map((link, i) => (
+              <div key={i} className="flex items-center gap-2 mb-1.5">
+                <a
+                  href={link}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs flex-1 truncate"
+                  style={{ color: "#0369a1" }}
+                >
+                  {link}
+                </a>
+                <button
+                  onClick={() => onUpdateDetail(item.notes ?? "", (item.links ?? []).filter((_, j) => j !== i))}
+                  className="text-xs flex-shrink-0"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <input
+              value={linkInput}
+              onChange={(e) => setLinkInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && linkInput.trim()) {
+                  const url = linkInput.trim().startsWith("http") ? linkInput.trim() : `https://${linkInput.trim()}`
+                  onUpdateDetail(item.notes ?? "", [...(item.links ?? []), url])
+                  setLinkInput("")
+                }
+              }}
+              placeholder="paste a link + enter"
+              className="w-full text-xs outline-none"
+              style={{
+                background: "transparent",
+                color: "var(--text-muted)",
+                borderBottom: "1px solid var(--surface-border)",
+                padding: "4px 0",
+              }}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -921,6 +1143,298 @@ function ContextPanel({
                 </span>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Queue Dropdown ───────────────────────────────────────────────────────────
+
+function QueueDropdown({
+  label,
+  items,
+  onPromote,
+}: {
+  label: string
+  items: Item[]
+  onPromote: (id: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener("mousedown", handleClick)
+    return () => document.removeEventListener("mousedown", handleClick)
+  }, [open])
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full"
+        style={{
+          background: open ? "rgba(0,0,0,0.08)" : "rgba(0,0,0,0.04)",
+          color: "var(--text-muted)",
+          transition: "background 150ms",
+        }}
+      >
+        {label}
+        <span className="font-bold tabular-nums hidden sm:inline" style={{ color: "#b45309" }}>
+          {items.length}
+        </span>
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 8px)",
+            left: label === "This Week" ? 0 : undefined,
+            right: label !== "This Week" ? 0 : undefined,
+            width: "280px",
+            background: "rgba(247,246,242,0.98)",
+            backdropFilter: "blur(12px)",
+            border: "1px solid var(--surface-border)",
+            borderRadius: "12px",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.1)",
+            padding: "0.75rem",
+            zIndex: 100,
+          }}
+        >
+          <p
+            className="text-xs font-bold tracking-widest uppercase mb-3"
+            style={{ color: "var(--text-muted)" }}
+          >
+            {label}
+          </p>
+          <div className="space-y-1">
+            {items.map((item) => (
+              <div key={item.id} className="flex items-center justify-between gap-3 py-1">
+                <span className="text-sm flex-1" style={{ color: "var(--foreground)" }}>
+                  {item.text}
+                </span>
+                <button
+                  className="text-xs flex-shrink-0"
+                  style={{ color: "#0369a1" }}
+                  onClick={() => { onPromote(item.id); setOpen(false) }}
+                >
+                  → today
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Focus View ───────────────────────────────────────────────────────────────
+
+function FocusView({
+  item,
+  onToggleDone,
+  onExit,
+}: {
+  item: Item
+  onToggleDone: (id: string) => void
+  onExit: () => void
+}) {
+  const [seconds, setSeconds] = useState(0)
+  const isDone = item.status === "done"
+
+  useEffect(() => {
+    const interval = setInterval(() => setSeconds((s) => s + 1), 1000)
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onExit()
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [onExit])
+
+  const mins = String(Math.floor(seconds / 60)).padStart(2, "0")
+  const secs = String(seconds % 60).padStart(2, "0")
+
+  return (
+    <div
+      className="flex flex-col items-center justify-center text-center"
+      style={{ minHeight: "calc(100vh - 57px)", padding: "2rem" }}
+    >
+      {/* Timer */}
+      <span
+        className="font-mono text-xs tracking-widest mb-10"
+        style={{ color: "var(--text-muted)", opacity: 0.5 }}
+      >
+        {mins}:{secs}
+      </span>
+
+      {/* Task text */}
+      <p
+        className="text-3xl font-black leading-snug max-w-sm mb-12"
+        style={{
+          fontFamily: "var(--font-playfair)",
+          color: isDone ? "var(--text-muted)" : "var(--foreground)",
+          textDecoration: isDone ? "line-through" : "none",
+          transition: "all 400ms ease",
+        }}
+      >
+        {item.text}
+      </p>
+
+      {/* Complete button */}
+      {!isDone ? (
+        <button
+          onClick={() => onToggleDone(item.id)}
+          className="w-14 h-14 rounded-full border-2 flex items-center justify-center transition-all"
+          style={{ borderColor: "var(--surface-border)" }}
+          aria-label="Mark done"
+        />
+      ) : (
+        <span className="text-sm" style={{ color: "#047857" }}>
+          Done ✓
+        </span>
+      )}
+
+      {/* Exit */}
+      {!isDone && (
+        <button
+          onClick={onExit}
+          className="mt-10 text-xs"
+          style={{ color: "var(--text-muted)", opacity: 0.35 }}
+        >
+          esc to exit
+        </button>
+      )}
+    </div>
+  )
+}
+
+// ─── Sync Indicator ───────────────────────────────────────────────────────────
+
+function SyncIndicator({
+  status,
+  token,
+  onChangeToken,
+}: {
+  status: "idle" | "syncing" | "synced" | "error"
+  token: string
+  onChangeToken: (t: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [tokenInput, setTokenInput] = useState("")
+  const [copied, setCopied] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener("mousedown", handleClick)
+    return () => document.removeEventListener("mousedown", handleClick)
+  }, [open])
+
+  function copyToken() {
+    navigator.clipboard.writeText(token)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  const dot =
+    status === "syncing" ? "🔄" :
+    status === "synced"  ? "·" :
+    status === "error"   ? "!" : "·"
+
+  const dotColor =
+    status === "syncing" ? "var(--text-muted)" :
+    status === "synced"  ? "#047857" :
+    status === "error"   ? "#dc2626" : "var(--text-muted)"
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="text-xs px-1.5 py-0.5 rounded"
+        style={{ color: dotColor, opacity: 0.7 }}
+        title="Sync"
+      >
+        {dot === "🔄" ? <span style={{ fontSize: "0.65rem" }}>↻</span> : dot}
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 8px)",
+            right: 0,
+            width: "260px",
+            background: "rgba(247,246,242,0.98)",
+            backdropFilter: "blur(12px)",
+            border: "1px solid var(--surface-border)",
+            borderRadius: "12px",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.1)",
+            padding: "0.875rem",
+            zIndex: 100,
+          }}
+        >
+          <p className="text-xs font-bold tracking-widest uppercase mb-3" style={{ color: "var(--text-muted)" }}>
+            Sync token
+          </p>
+          <div className="flex items-center gap-2 mb-4">
+            <code
+              className="text-xs flex-1 truncate"
+              style={{ color: "var(--foreground)", fontFamily: "monospace" }}
+            >
+              {token.slice(0, 8)}…
+            </code>
+            <button
+              onClick={copyToken}
+              className="text-xs flex-shrink-0"
+              style={{ color: "#0369a1" }}
+            >
+              {copied ? "Copied!" : "Copy"}
+            </button>
+          </div>
+
+          <p className="text-xs mb-1.5" style={{ color: "var(--text-muted)" }}>
+            Use on another device:
+          </p>
+          <div className="flex gap-2">
+            <input
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              placeholder="paste token…"
+              className="flex-1 text-xs outline-none"
+              style={{
+                borderBottom: "1px solid var(--surface-border)",
+                padding: "3px 0",
+                background: "transparent",
+                color: "var(--foreground)",
+              }}
+            />
+            <button
+              onClick={() => {
+                if (tokenInput.trim()) {
+                  onChangeToken(tokenInput.trim())
+                  setTokenInput("")
+                  setOpen(false)
+                }
+              }}
+              className="text-xs flex-shrink-0"
+              style={{ color: "#0369a1" }}
+            >
+              Link
+            </button>
           </div>
         </div>
       )}
