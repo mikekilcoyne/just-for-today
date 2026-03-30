@@ -95,9 +95,9 @@ function getWeekDays(dateStr: string): string[] {
 function getDayDateForWeek(dayName: string, anchorDate: string): string {
   const dayMap: Record<string, number> = {
     monday: 1, mon: 1,
-    tuesday: 2, tue: 2,
-    wednesday: 3, wed: 3,
-    thursday: 4, thu: 4,
+    tuesday: 2, tue: 2, tues: 2,
+    wednesday: 3, wed: 3, weds: 3,
+    thursday: 4, thu: 4, thur: 4, thurs: 4,
     friday: 5, fri: 5,
     saturday: 6, sat: 6,
     sunday: 0, sun: 0,
@@ -182,10 +182,33 @@ function parseBrainDump(text: string, anchorDate: string): {
   otherDays: Record<string, Item[]>
 } {
   const now = new Date().toISOString()
-  const dayHeaderRe = /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)[:\s\-–—]*$/i
+  const dayHeaderRe = /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)[:\s\-–—]*$/i
+  const calendarHeaderRe = /^(calendar\s+(?:week|events?)|week\s+at\s+a\s+glance)[:\s\-–—]*$/i
+  const sectionHeaderRe = /^[a-z][a-z0-9 '&/+]{1,30}:\s*$/i
   const stripBullet = (s: string) => s.replace(/^[\s\u2022\u2023\u25E6\u2043\-*\d.)]+/, "").trim()
+  const stripEventBullet = (s: string) => s.replace(/^[\s\u2022\u2023\u25E6\u2043\-*]+/, "").trim()
+  const looksLikeCalendarEvent = (s: string) =>
+    /^(\d{1,2}(?::\d{2})?\s*[-–—]\s*\d{1,2}(?::\d{2})?|\d{3,4}\s*[-–—])/.test(s) ||
+    /(?:^|[\s(])\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s) ||
+    /(?:^|[\s(])\d{3,4}\b/.test(s) ||
+    /\b\d{1,2}\s*o['’]?clock\b/i.test(s) ||
+    /(?:@|at)\s*\d{1,2}(?::\d{2})?\b/i.test(s) ||
+    /(?:@|at)\s*\d{3,4}\b/i.test(s)
+  const weekStartDate = getWeekDays(anchorDate)[0]
 
-  let currentDay: string | null = null // null → goes to anchorDate
+  function makeItem(text: string, isEvent: boolean): Item {
+    return {
+      id: crypto.randomUUID(),
+      text,
+      priority: "unassigned",
+      status: "active",
+      created_at: now,
+      type: isEvent ? "event" : undefined,
+    }
+  }
+
+  let currentEventDate: string | null = null
+  let inCalendarSection = false
   const items: Item[] = []
   const otherDays: Record<string, Item[]> = {}
 
@@ -193,31 +216,39 @@ function parseBrainDump(text: string, anchorDate: string): {
     const trimmed = line.trim()
     if (!trimmed) continue
 
-    const dayMatch = trimmed.match(dayHeaderRe)
-    if (dayMatch) {
-      const date = getDayDateForWeek(dayMatch[1], anchorDate)
-      currentDay = date === anchorDate ? null : date
+    if (calendarHeaderRe.test(trimmed)) {
+      inCalendarSection = true
+      currentEventDate = weekStartDate
       continue
     }
 
+    const dayMatch = trimmed.match(dayHeaderRe)
+    if (dayMatch) {
+      currentEventDate = getDayDateForWeek(dayMatch[1], anchorDate)
+      inCalendarSection = true
+      continue
+    }
+
+    if (inCalendarSection && sectionHeaderRe.test(trimmed)) {
+      inCalendarSection = false
+      currentEventDate = null
+      continue
+    }
+
+    const eventText = stripEventBullet(trimmed)
     const itemText = stripBullet(trimmed)
+    if (eventText.length < 2 && itemText.length < 2) continue
+    if (inCalendarSection && currentEventDate) {
+      if (!looksLikeCalendarEvent(eventText)) continue
+      const item = makeItem(eventText, true)
+      if (currentEventDate === anchorDate) items.push(item)
+      else otherDays[currentEventDate] = [...(otherDays[currentEventDate] ?? []), item]
+      continue
+    }
     if (itemText.length < 2) continue
-    if (!currentDay && isIntentionPhrase(itemText)) continue
+    if (isIntentionPhrase(itemText)) continue
 
-    const item: Item = {
-      id: crypto.randomUUID(),
-      text: itemText,
-      priority: currentDay ? "week" : "unassigned",
-      status: "active",
-      created_at: now,
-      type: currentDay ? "event" : undefined,
-    }
-
-    if (currentDay) {
-      otherDays[currentDay] = [...(otherDays[currentDay] ?? []), item]
-    } else {
-      items.push(item)
-    }
+    items.push(makeItem(itemText, false))
   }
 
   return { items, otherDays }
@@ -275,7 +306,6 @@ export default function HomeClient() {
         setSyncStatus("synced")
       })
       .catch(() => setSyncStatus("error"))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Load data for selected date
@@ -393,8 +423,8 @@ export default function HomeClient() {
     )
     .slice(0, 5)
 
-  const weekItems = dayData?.items.filter((i) => i.priority === "week" && i.status === "active") ?? []
-  const laterItems = dayData?.items.filter((i) => i.priority === "later" && i.status === "active") ?? []
+  const weekItems = dayData?.items.filter((i) => i.type !== "event" && i.priority === "week" && i.status === "active") ?? []
+  const laterItems = dayData?.items.filter((i) => i.type !== "event" && i.priority === "later" && i.status === "active") ?? []
 
   return (
     <div className="min-h-screen" style={{ background: "var(--background)" }}>
