@@ -28,7 +28,7 @@ interface Item {
   id: string
   text: string
   priority: Priority
-  status: "active" | "done"
+  status: "active" | "done" | "archived"
   created_at: string
   type?: "event" // calendar events parsed from day headers
   notes?: string
@@ -866,7 +866,8 @@ export default function HomeClient() {
               <ContextPanel
                 done={recentlyDone}
                 active={stillActive}
-                onArchive={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, priority: "later" }))}
+                onLater={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, priority: "later" }))}
+                onArchive={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, status: "archived" }))}
                 onComplete={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, status: "done" }))}
               />
             )}
@@ -895,7 +896,7 @@ function WeekStrip({
       {weekDays.map((date, i) => {
         const data = loadDay(date)
         const events = data?.items.filter((item) => item.type === "event") ?? []
-        const tasks = data?.items.filter((item) => item.type !== "event") ?? []
+        const tasks = data?.items.filter((item) => item.type !== "event" && item.status !== "archived") ?? []
         const doneTasks = tasks.filter((t) => t.status === "done").length
         const isToday = date === today
         const isSelected = date === selectedDate
@@ -1087,7 +1088,7 @@ function TriageView({
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const events = items.filter((i) => i.type === "event")
-  const tasks = items.filter((i) => i.type !== "event")
+  const tasks = items.filter((i) => i.type !== "event" && i.status !== "archived")
 
   const priorityOrder: Record<Priority, number> = { today: 0, week: 1, later: 2, unassigned: 3 }
   const sortedTasks = [...tasks].sort((a, b) => {
@@ -1424,11 +1425,13 @@ function ItemCard({
 function ContextPanel({
   done,
   active,
+  onLater,
   onArchive,
   onComplete,
 }: {
   done: (Item & { date: string })[]
   active: (Item & { date: string })[]
+  onLater: (date: string, id: string) => void
   onArchive: (date: string, id: string) => void
   onComplete: (date: string, id: string) => void
 }) {
@@ -1492,10 +1495,10 @@ function ContextPanel({
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       className="text-xs px-2.5 py-1 rounded-full"
-                      style={{ background: "rgba(4,120,87,0.08)", color: "#047857" }}
-                      onClick={() => onComplete(item.date, item.id)}
+                      style={{ background: "rgba(180,83,9,0.08)", color: "#b45309" }}
+                      onClick={() => onLater(item.date, item.id)}
                     >
-                      check off
+                      later
                     </button>
                     <button
                       className="text-xs px-2.5 py-1 rounded-full"
@@ -1503,6 +1506,13 @@ function ContextPanel({
                       onClick={() => onArchive(item.date, item.id)}
                     >
                       archive
+                    </button>
+                    <button
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={{ background: "rgba(4,120,87,0.08)", color: "#047857" }}
+                      onClick={() => onComplete(item.date, item.id)}
+                    >
+                      check off
                     </button>
                     {item.project && (
                       <ProjectBadge project={item.project} />
@@ -1944,6 +1954,7 @@ function ProjectView({
 }) {
   const activeCount = entries.filter((entry) => entry.item.status === "active").length
   const doneCount = entries.filter((entry) => entry.item.status === "done").length
+  const archivedCount = entries.filter((entry) => entry.item.status === "archived").length
   const totalFocus = entries.reduce((sum, entry) => sum + (entry.item.focus_seconds ?? 0), 0)
   const grouped = entries.reduce<Record<string, Item[]>>((acc, entry) => {
     acc[entry.date] = [...(acc[entry.date] ?? []), entry.item]
@@ -1961,7 +1972,7 @@ function ProjectView({
             {project}
           </h1>
           <p className="text-sm" style={{ color: "var(--text-muted)" }}>
-            {activeCount} active · {doneCount} done · {formatDurationCompact(totalFocus)} focused
+            {activeCount} active · {doneCount} done · {archivedCount} archived · {formatDurationCompact(totalFocus)} focused
           </p>
         </div>
       </div>
@@ -2005,7 +2016,13 @@ function ProjectView({
                           </span>
                         )}
                         <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-                          {item.status === "done" ? "done" : item.priority === "unassigned" ? "active" : item.priority}
+                          {item.status === "done"
+                            ? "done"
+                            : item.status === "archived"
+                              ? "archived"
+                              : item.priority === "unassigned"
+                                ? "active"
+                                : item.priority}
                         </span>
                         {(item.focus_seconds ?? 0) > 0 && (
                           <span className="text-xs" style={{ color: "var(--text-muted)" }}>
