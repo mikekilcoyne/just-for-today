@@ -111,6 +111,113 @@ function safeStorageKeys() {
   }
 }
 
+function getUrlSyncToken() {
+  if (typeof window === "undefined") return null
+  try {
+    const url = new URL(window.location.href)
+    const token = url.searchParams.get("syncToken") ?? url.searchParams.get("token")
+    return token?.trim() ? token.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function clearUrlSyncToken() {
+  if (typeof window === "undefined") return
+  try {
+    const url = new URL(window.location.href)
+    if (!url.searchParams.has("syncToken") && !url.searchParams.has("token")) return
+    url.searchParams.delete("syncToken")
+    url.searchParams.delete("token")
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
+  } catch {}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function normalizePriority(value: unknown): Priority {
+  if (value === "today" || value === "week" || value === "later" || value === "unassigned") return value
+  return "unassigned"
+}
+
+function normalizeStatus(value: unknown): Item["status"] {
+  if (value === "done" || value === "archived" || value === "active") return value
+  return "active"
+}
+
+function normalizeStringList(value: unknown) {
+  if (!Array.isArray(value)) return undefined
+  const list = value.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean)
+  return list.length > 0 ? list : undefined
+}
+
+function normalizeItem(value: unknown): Item | null {
+  if (!isRecord(value)) return null
+  const text = typeof value.text === "string" ? value.text.trim() : ""
+  if (!text) return null
+
+  const project = typeof value.project === "string" ? normalizeProjectName(value.project) : ""
+  const focusSeconds = typeof value.focus_seconds === "number" && Number.isFinite(value.focus_seconds)
+    ? Math.max(0, Math.floor(value.focus_seconds))
+    : undefined
+
+  return {
+    id: typeof value.id === "string" && value.id.trim() ? value.id : makeId(),
+    text,
+    priority: normalizePriority(value.priority),
+    status: normalizeStatus(value.status),
+    created_at: typeof value.created_at === "string" && value.created_at ? value.created_at : new Date().toISOString(),
+    type: value.type === "event" ? "event" : undefined,
+    notes: typeof value.notes === "string" && value.notes.trim() ? value.notes.trim() : undefined,
+    links: normalizeStringList(value.links),
+    project: project || undefined,
+    focus_seconds: focusSeconds,
+    last_focused_at: typeof value.last_focused_at === "string" && value.last_focused_at ? value.last_focused_at : undefined,
+  }
+}
+
+function normalizeDayData(value: unknown, fallbackDate?: string): DayData | null {
+  if (!isRecord(value)) return null
+  const date = typeof value.date === "string" && value.date ? value.date : fallbackDate
+  if (!date) return null
+
+  return {
+    date,
+    brain_dump: typeof value.brain_dump === "string" ? value.brain_dump : "",
+    items: Array.isArray(value.items) ? value.items.map(normalizeItem).filter((item): item is Item => Boolean(item)) : [],
+  }
+}
+
+function normalizeMeta(value: unknown): AppMeta {
+  if (!isRecord(value)) return { current_streak: 0, last_active_date: null }
+  const currentStreak = typeof value.current_streak === "number" && Number.isFinite(value.current_streak)
+    ? Math.max(0, Math.floor(value.current_streak))
+    : 0
+  const lastActiveDate = typeof value.last_active_date === "string" && value.last_active_date ? value.last_active_date : null
+  return { current_streak: currentStreak, last_active_date: lastActiveDate }
+}
+
+function normalizeFocusSession(value: unknown): FocusSession | null {
+  if (!isRecord(value)) return null
+  if (
+    typeof value.date !== "string" ||
+    !value.date ||
+    typeof value.itemId !== "string" ||
+    !value.itemId ||
+    typeof value.startedAt !== "string" ||
+    !value.startedAt
+  ) {
+    return null
+  }
+  return {
+    date: value.date,
+    itemId: value.itemId,
+    startedAt: value.startedAt,
+  }
+}
+
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 
 function formatDateStr(date: Date): string {
@@ -179,14 +286,16 @@ function getDayDateForWeek(dayName: string, anchorDate: string): string {
 function loadDay(date: string): DayData | null {
   try {
     const raw = safeStorageGet(STORAGE_PREFIX + date)
-    return raw ? (JSON.parse(raw) as DayData) : null
+    return raw ? normalizeDayData(JSON.parse(raw), date) : null
   } catch {
     return null
   }
 }
 
 function saveDay(data: DayData): void {
-  safeStorageSet(STORAGE_PREFIX + data.date, JSON.stringify(data))
+  const normalized = normalizeDayData(data, data.date)
+  if (!normalized) return
+  safeStorageSet(STORAGE_PREFIX + normalized.date, JSON.stringify(normalized))
 }
 
 function loadAllDays(): DayData[] {
@@ -197,7 +306,7 @@ function loadAllDays(): DayData[] {
   return keys
     .map((key) => {
       try {
-        return JSON.parse(safeStorageGet(key) ?? "") as DayData
+        return normalizeDayData(JSON.parse(safeStorageGet(key) ?? ""))
       } catch {
         return null
       }
@@ -208,7 +317,7 @@ function loadAllDays(): DayData[] {
 function loadMeta(): AppMeta {
   try {
     const raw = safeStorageGet(META_KEY)
-    if (raw) return JSON.parse(raw) as AppMeta
+    if (raw) return normalizeMeta(JSON.parse(raw))
   } catch {}
   return { current_streak: 0, last_active_date: null }
 }
@@ -216,7 +325,7 @@ function loadMeta(): AppMeta {
 function loadFocusSession(): FocusSession | null {
   try {
     const raw = safeStorageGet(FOCUS_SESSION_KEY)
-    return raw ? (JSON.parse(raw) as FocusSession) : null
+    return raw ? normalizeFocusSession(JSON.parse(raw)) : null
   } catch {
     return null
   }
@@ -260,7 +369,7 @@ function getElapsedFocusSeconds(session: FocusSession, now = Date.now()) {
 function collectProjectNames(days: DayData[]) {
   const names = new Set(COMMON_PROJECTS)
   days.forEach((day) => {
-    day.items.forEach((item) => {
+    ;(day.items ?? []).forEach((item) => {
       const project = normalizeProjectName(item.project ?? "")
       if (project) names.add(project)
     })
@@ -444,26 +553,31 @@ export default function HomeClient() {
 
   // Init sync token + pull remote data on mount
   useEffect(() => {
+    const urlToken = getUrlSyncToken()
     const stored = safeStorageGet("jft-sync-token")
-    const token = stored ?? makeId()
-    if (!stored) safeStorageSet("jft-sync-token", token)
+    const token = urlToken ?? stored ?? makeId()
+    if (urlToken) clearUrlSyncToken()
+    if (token !== stored) safeStorageSet("jft-sync-token", token)
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSyncToken(token)
     setSyncStatus("syncing")
 
     pullAll(token)
       .then(({ days, meta: remoteMeta }) => {
-        days.forEach((remote) => {
+        days.forEach((remoteRaw) => {
+          const remote = normalizeDayData(remoteRaw)
+          if (!remote) return
           const local = loadDay(remote.date)
-          if (!local || (remote.items as unknown[]).length >= local.items.length) {
+          if (!local || remote.items.length >= local.items.length) {
             safeStorageSet(`jft2-${remote.date}`, JSON.stringify(remote))
           }
         })
         if (remoteMeta) {
           const localMeta = loadMeta()
-          if (remoteMeta.current_streak >= localMeta.current_streak) {
-            saveMeta(remoteMeta)
-            setMeta(remoteMeta)
+          const normalizedRemoteMeta = normalizeMeta(remoteMeta)
+          if (normalizedRemoteMeta.current_streak >= localMeta.current_streak) {
+            saveMeta(normalizedRemoteMeta)
+            setMeta(normalizedRemoteMeta)
           }
         }
         // Reload current day in case remote data changed it
@@ -776,10 +890,16 @@ export default function HomeClient() {
                   setSyncStatus("syncing")
                   pullAll(t)
                     .then(({ days, meta: remoteMeta }) => {
-                      days.forEach((remote) => {
+                      days.forEach((remoteRaw) => {
+                        const remote = normalizeDayData(remoteRaw)
+                        if (!remote) return
                         safeStorageSet(`jft2-${remote.date}`, JSON.stringify(remote))
                       })
-                      if (remoteMeta) { saveMeta(remoteMeta); setMeta(remoteMeta) }
+                      if (remoteMeta) {
+                        const normalizedRemoteMeta = normalizeMeta(remoteMeta)
+                        saveMeta(normalizedRemoteMeta)
+                        setMeta(normalizedRemoteMeta)
+                      }
                       const fresh = loadDay(selectedDate)
                       if (fresh) { setDayData(fresh); setRawDump(fresh.brain_dump); setView("triage") }
                       setSyncStatus("synced")
@@ -793,7 +913,7 @@ export default function HomeClient() {
                   const days = keys
                     .map((k) => {
                       try {
-                        return JSON.parse(safeStorageGet(k) ?? "")
+                        return normalizeDayData(JSON.parse(safeStorageGet(k) ?? ""))
                       } catch {
                         return null
                       }
@@ -2301,6 +2421,9 @@ function SyncIndicator({
 
           <p className="text-xs mb-1.5" style={{ color: "var(--text-muted)" }}>
             Use on another device:
+          </p>
+          <p className="text-[11px] leading-relaxed mb-2.5" style={{ color: "var(--text-muted)", opacity: 0.8 }}>
+            Localhost has its own browser storage, so paste the same cloud token here once to pull your Vercel data.
           </p>
           <div className="flex gap-2">
             <input
