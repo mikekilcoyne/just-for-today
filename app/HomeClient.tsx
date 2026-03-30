@@ -73,6 +73,44 @@ const COMMON_PROJECT_ALIASES: Record<string, string[]> = {
   "YSJ site": ["ysj site", "ysj"],
 }
 
+function makeId() {
+  const cryptoApi = globalThis.crypto
+  if (cryptoApi && typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID()
+  return `jft-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function safeStorageGet(key: string) {
+  if (typeof window === "undefined") return null
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function safeStorageSet(key: string, value: string) {
+  if (typeof window === "undefined") return
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {}
+}
+
+function safeStorageRemove(key: string) {
+  if (typeof window === "undefined") return
+  try {
+    window.localStorage.removeItem(key)
+  } catch {}
+}
+
+function safeStorageKeys() {
+  if (typeof window === "undefined") return []
+  try {
+    return Object.keys(window.localStorage)
+  } catch {
+    return []
+  }
+}
+
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 
 function formatDateStr(date: Date): string {
@@ -140,7 +178,7 @@ function getDayDateForWeek(dayName: string, anchorDate: string): string {
 
 function loadDay(date: string): DayData | null {
   try {
-    const raw = localStorage.getItem(STORAGE_PREFIX + date)
+    const raw = safeStorageGet(STORAGE_PREFIX + date)
     return raw ? (JSON.parse(raw) as DayData) : null
   } catch {
     return null
@@ -148,19 +186,18 @@ function loadDay(date: string): DayData | null {
 }
 
 function saveDay(data: DayData): void {
-  localStorage.setItem(STORAGE_PREFIX + data.date, JSON.stringify(data))
+  safeStorageSet(STORAGE_PREFIX + data.date, JSON.stringify(data))
 }
 
 function loadAllDays(): DayData[] {
-  if (typeof window === "undefined") return []
-  const keys = Object.keys(localStorage)
+  const keys = safeStorageKeys()
     .filter((key) => key.startsWith(STORAGE_PREFIX))
     .sort()
 
   return keys
     .map((key) => {
       try {
-        return JSON.parse(localStorage.getItem(key) ?? "") as DayData
+        return JSON.parse(safeStorageGet(key) ?? "") as DayData
       } catch {
         return null
       }
@@ -170,16 +207,15 @@ function loadAllDays(): DayData[] {
 
 function loadMeta(): AppMeta {
   try {
-    const raw = localStorage.getItem(META_KEY)
+    const raw = safeStorageGet(META_KEY)
     if (raw) return JSON.parse(raw) as AppMeta
   } catch {}
   return { current_streak: 0, last_active_date: null }
 }
 
 function loadFocusSession(): FocusSession | null {
-  if (typeof window === "undefined") return null
   try {
-    const raw = localStorage.getItem(FOCUS_SESSION_KEY)
+    const raw = safeStorageGet(FOCUS_SESSION_KEY)
     return raw ? (JSON.parse(raw) as FocusSession) : null
   } catch {
     return null
@@ -187,12 +223,11 @@ function loadFocusSession(): FocusSession | null {
 }
 
 function saveFocusSession(session: FocusSession | null) {
-  if (typeof window === "undefined") return
   if (!session) {
-    localStorage.removeItem(FOCUS_SESSION_KEY)
+    safeStorageRemove(FOCUS_SESSION_KEY)
     return
   }
-  localStorage.setItem(FOCUS_SESSION_KEY, JSON.stringify(session))
+  safeStorageSet(FOCUS_SESSION_KEY, JSON.stringify(session))
 }
 
 function normalizeProjectName(value: string) {
@@ -268,7 +303,7 @@ function getProjectEntries(days: DayData[], project: string) {
 }
 
 function saveMeta(meta: AppMeta): void {
-  localStorage.setItem(META_KEY, JSON.stringify(meta))
+  safeStorageSet(META_KEY, JSON.stringify(meta))
 }
 
 function getRecentDays(n: number, today: string): DayData[] {
@@ -327,7 +362,7 @@ function parseBrainDump(text: string, anchorDate: string): {
 
   function makeItem(text: string, isEvent: boolean): Item {
     return {
-      id: crypto.randomUUID(),
+      id: makeId(),
       text,
       priority: "unassigned",
       status: "active",
@@ -409,9 +444,9 @@ export default function HomeClient() {
 
   // Init sync token + pull remote data on mount
   useEffect(() => {
-    const stored = localStorage.getItem("jft-sync-token")
-    const token = stored ?? crypto.randomUUID()
-    if (!stored) localStorage.setItem("jft-sync-token", token)
+    const stored = safeStorageGet("jft-sync-token")
+    const token = stored ?? makeId()
+    if (!stored) safeStorageSet("jft-sync-token", token)
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSyncToken(token)
     setSyncStatus("syncing")
@@ -421,7 +456,7 @@ export default function HomeClient() {
         days.forEach((remote) => {
           const local = loadDay(remote.date)
           if (!local || (remote.items as unknown[]).length >= local.items.length) {
-            localStorage.setItem(`jft2-${remote.date}`, JSON.stringify(remote))
+            safeStorageSet(`jft2-${remote.date}`, JSON.stringify(remote))
           }
         })
         if (remoteMeta) {
@@ -626,7 +661,7 @@ export default function HomeClient() {
   function addItem() {
     if (!dayData) return
     const item: Item = {
-      id: crypto.randomUUID(),
+      id: makeId(),
       text: "",
       priority: "unassigned",
       status: "active",
@@ -736,13 +771,13 @@ export default function HomeClient() {
                 status={syncStatus}
                 token={syncToken}
                 onChangeToken={(t) => {
-                  localStorage.setItem("jft-sync-token", t)
+                  safeStorageSet("jft-sync-token", t)
                   setSyncToken(t)
                   setSyncStatus("syncing")
                   pullAll(t)
                     .then(({ days, meta: remoteMeta }) => {
                       days.forEach((remote) => {
-                        localStorage.setItem(`jft2-${remote.date}`, JSON.stringify(remote))
+                        safeStorageSet(`jft2-${remote.date}`, JSON.stringify(remote))
                       })
                       if (remoteMeta) { saveMeta(remoteMeta); setMeta(remoteMeta) }
                       const fresh = loadDay(selectedDate)
@@ -754,8 +789,16 @@ export default function HomeClient() {
                 onPushAll={() => {
                   if (!syncToken) return
                   setSyncStatus("syncing")
-                  const keys = Object.keys(localStorage).filter((k) => k.startsWith("jft2-"))
-                  const days = keys.map((k) => JSON.parse(localStorage.getItem(k)!))
+                  const keys = safeStorageKeys().filter((k) => k.startsWith("jft2-"))
+                  const days = keys
+                    .map((k) => {
+                      try {
+                        return JSON.parse(safeStorageGet(k) ?? "")
+                      } catch {
+                        return null
+                      }
+                    })
+                    .filter(Boolean)
                   Promise.all(days.map((d) => pushDay(syncToken, d)))
                     .then(() => pushMeta(syncToken, meta))
                     .then(() => setSyncStatus("synced"))
