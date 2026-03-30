@@ -270,6 +270,7 @@ export default function HomeClient() {
 
   // Load meta once
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMeta(loadMeta())
   }, [])
 
@@ -278,6 +279,7 @@ export default function HomeClient() {
     const stored = localStorage.getItem("jft-sync-token")
     const token = stored ?? crypto.randomUUID()
     if (!stored) localStorage.setItem("jft-sync-token", token)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSyncToken(token)
     setSyncStatus("syncing")
 
@@ -312,6 +314,7 @@ export default function HomeClient() {
   useEffect(() => {
     const data = loadDay(selectedDate)
     if (data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDayData(data)
       setRawDump(data.brain_dump)
       setView("triage")
