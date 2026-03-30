@@ -33,6 +33,9 @@ interface Item {
   type?: "event" // calendar events parsed from day headers
   notes?: string
   links?: string[]
+  project?: string
+  focus_seconds?: number
+  last_focused_at?: string
 }
 
 interface DayData {
@@ -46,11 +49,29 @@ interface AppMeta {
   last_active_date: string | null
 }
 
+interface FocusSession {
+  date: string
+  itemId: string
+  startedAt: string
+}
+
+interface ProjectEntry {
+  date: string
+  item: Item
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STORAGE_PREFIX = "jft2-"
 const META_KEY = "jft2-meta"
+const FOCUS_SESSION_KEY = "jft2-focus-session"
 const DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+const COMMON_PROJECTS = ["Just For Today", "Breakfast Clubbing", "YSJ site"]
+const COMMON_PROJECT_ALIASES: Record<string, string[]> = {
+  "Just For Today": ["just for today", "jft"],
+  "Breakfast Clubbing": ["breakfast clubbing", "breakfast club"],
+  "YSJ site": ["ysj site", "ysj"],
+}
 
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 
@@ -130,12 +151,120 @@ function saveDay(data: DayData): void {
   localStorage.setItem(STORAGE_PREFIX + data.date, JSON.stringify(data))
 }
 
+function loadAllDays(): DayData[] {
+  if (typeof window === "undefined") return []
+  const keys = Object.keys(localStorage)
+    .filter((key) => key.startsWith(STORAGE_PREFIX))
+    .sort()
+
+  return keys
+    .map((key) => {
+      try {
+        return JSON.parse(localStorage.getItem(key) ?? "") as DayData
+      } catch {
+        return null
+      }
+    })
+    .filter((day): day is DayData => Boolean(day))
+}
+
 function loadMeta(): AppMeta {
   try {
     const raw = localStorage.getItem(META_KEY)
     if (raw) return JSON.parse(raw) as AppMeta
   } catch {}
   return { current_streak: 0, last_active_date: null }
+}
+
+function loadFocusSession(): FocusSession | null {
+  if (typeof window === "undefined") return null
+  try {
+    const raw = localStorage.getItem(FOCUS_SESSION_KEY)
+    return raw ? (JSON.parse(raw) as FocusSession) : null
+  } catch {
+    return null
+  }
+}
+
+function saveFocusSession(session: FocusSession | null) {
+  if (typeof window === "undefined") return
+  if (!session) {
+    localStorage.removeItem(FOCUS_SESSION_KEY)
+    return
+  }
+  localStorage.setItem(FOCUS_SESSION_KEY, JSON.stringify(session))
+}
+
+function normalizeProjectName(value: string) {
+  return value.replace(/\s+/g, " ").trim()
+}
+
+function formatDurationCompact(seconds: number) {
+  if (seconds <= 0) return "0m"
+  if (seconds < 60) return `${seconds}s`
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  if (hours === 0) return `${minutes}m`
+  if (minutes === 0) return `${hours}h`
+  return `${hours}h ${minutes}m`
+}
+
+function formatDurationClock(seconds: number) {
+  const total = Math.max(0, seconds)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secs = total % 60
+  if (hours > 0) return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+  return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+}
+
+function getElapsedFocusSeconds(session: FocusSession, now = Date.now()) {
+  return Math.max(0, Math.floor((now - new Date(session.startedAt).getTime()) / 1000))
+}
+
+function collectProjectNames(days: DayData[]) {
+  const names = new Set(COMMON_PROJECTS)
+  days.forEach((day) => {
+    day.items.forEach((item) => {
+      const project = normalizeProjectName(item.project ?? "")
+      if (project) names.add(project)
+    })
+  })
+  return [...names].sort((a, b) => a.localeCompare(b))
+}
+
+function inferProjectSuggestions(item: Item, projectNames: string[]) {
+  const haystack = `${item.text} ${item.notes ?? ""}`.toLowerCase()
+  const suggestions = new Set<string>()
+
+  projectNames.forEach((name) => {
+    if (item.project === name) suggestions.add(name)
+  })
+
+  Object.entries(COMMON_PROJECT_ALIASES).forEach(([project, aliases]) => {
+    if (aliases.some((alias) => haystack.includes(alias))) suggestions.add(project)
+  })
+
+  projectNames.forEach((name) => {
+    const lowered = name.toLowerCase()
+    if (lowered.length >= 4 && haystack.includes(lowered)) suggestions.add(name)
+  })
+
+  return [...suggestions].sort((a, b) => a.localeCompare(b))
+}
+
+function getProjectEntries(days: DayData[], project: string) {
+  const normalized = normalizeProjectName(project).toLowerCase()
+  return days
+    .flatMap((day) =>
+      day.items
+        .filter((item) => normalizeProjectName(item.project ?? "").toLowerCase() === normalized)
+        .map((item) => ({ date: day.date, item }))
+    )
+    .sort((a, b) => {
+      if (a.date !== b.date) return b.date.localeCompare(a.date)
+      return a.item.created_at.localeCompare(b.item.created_at)
+    })
 }
 
 function saveMeta(meta: AppMeta): void {
@@ -260,13 +389,17 @@ export default function HomeClient() {
   const today = getTodayStr()
 
   const [selectedDate, setSelectedDate] = useState(today)
-  const [view, setView] = useState<"dump" | "triage">("dump")
+  const [view, setView] = useState<"dump" | "triage" | "project">("dump")
   const [rawDump, setRawDump] = useState("")
   const [dayData, setDayData] = useState<DayData | null>(null)
   const [meta, setMeta] = useState<AppMeta>({ current_streak: 0, last_active_date: null })
   const [editingId, setEditingId] = useState<string | null>(null)
   const [syncToken, setSyncToken] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "synced" | "error">("idle")
+  const [focusedItemId, setFocusedItemId] = useState<string | null>(null)
+  const [selectedProject, setSelectedProject] = useState<string | null>(null)
+  const [activeFocus, setActiveFocus] = useState<FocusSession | null>(() => loadFocusSession())
+  const [focusNow, setFocusNow] = useState(0)
 
   // Load meta once
   useEffect(() => {
@@ -325,6 +458,18 @@ export default function HomeClient() {
     }
   }, [selectedDate])
 
+  useEffect(() => {
+    saveFocusSession(activeFocus)
+  }, [activeFocus])
+
+  useEffect(() => {
+    if (!activeFocus) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setFocusNow(Date.now())
+    const interval = setInterval(() => setFocusNow(Date.now()), 1000)
+    return () => clearInterval(interval)
+  }, [activeFocus])
+
   // ── Brain dump submit ──
 
   function handleSubmit() {
@@ -351,12 +496,72 @@ export default function HomeClient() {
 
   // ── Item mutations ──
 
+  function persistDay(data: DayData) {
+    saveDay(data)
+    if (data.date === selectedDate) setDayData(data)
+    if (syncToken) pushDay(syncToken, data).catch(console.error)
+  }
+
   function mutateItems(items: Item[]) {
     if (!dayData) return
     const updated = { ...dayData, items }
-    setDayData(updated)
-    saveDay(updated)
-    if (syncToken) pushDay(syncToken, updated).catch(console.error)
+    persistDay(updated)
+  }
+
+  function mutateStoredDay(date: string, mutator: (data: DayData) => DayData | null) {
+    const existing = loadDay(date)
+    if (!existing) return
+    const updated = mutator(existing)
+    if (!updated) return
+    persistDay(updated)
+  }
+
+  function finalizeFocusSession(session: FocusSession | null) {
+    if (!session) return
+    const elapsed = getElapsedFocusSeconds(session)
+    if (elapsed <= 0) return
+
+    mutateStoredDay(session.date, (data) => {
+      let changed = false
+      const items = data.items.map((item) => {
+        if (item.id !== session.itemId) return item
+        changed = true
+        return {
+          ...item,
+          focus_seconds: (item.focus_seconds ?? 0) + elapsed,
+          last_focused_at: new Date().toISOString(),
+        }
+      })
+      return changed ? { ...data, items } : null
+    })
+  }
+
+  function clearActiveFocus(closeView = false) {
+    setActiveFocus(null)
+    if (closeView) setFocusedItemId(null)
+  }
+
+  function pauseActiveFocus(closeView = false) {
+    if (!activeFocus) return
+    finalizeFocusSession(activeFocus)
+    clearActiveFocus(closeView)
+  }
+
+  function startFocus(id: string) {
+    if (activeFocus) {
+      if (activeFocus.date === selectedDate && activeFocus.itemId === id) {
+        setFocusedItemId(id)
+        return
+      }
+      finalizeFocusSession(activeFocus)
+    }
+
+    setActiveFocus({
+      date: selectedDate,
+      itemId: id,
+      startedAt: new Date().toISOString(),
+    })
+    setFocusedItemId(id)
   }
 
   function setPriority(id: string, priority: Priority) {
@@ -368,8 +573,21 @@ export default function HomeClient() {
     if (!dayData) return
     const item = dayData.items.find((i) => i.id === id)
     if (!item) return
-    const newStatus = item.status === "done" ? "active" : "done"
-    mutateItems(dayData.items.map((i) => (i.id === id ? { ...i, status: newStatus } : i)))
+    const newStatus: Item["status"] = item.status === "done" ? "active" : "done"
+    const justFocused = activeFocus && activeFocus.date === dayData.date && activeFocus.itemId === id
+    const elapsed = justFocused ? getElapsedFocusSeconds(activeFocus) : 0
+    const updatedItems = dayData.items.map((i) =>
+      i.id === id
+        ? {
+            ...i,
+            status: newStatus,
+            focus_seconds: (i.focus_seconds ?? 0) + elapsed,
+            last_focused_at: elapsed > 0 ? new Date().toISOString() : i.last_focused_at,
+          }
+        : i
+    )
+    if (justFocused) clearActiveFocus(true)
+    mutateItems(updatedItems)
     if (newStatus === "done") {
       fireBalloons()
       const newMeta = computeStreak(meta, today)
@@ -388,6 +606,9 @@ export default function HomeClient() {
 
   function deleteItem(id: string) {
     if (!dayData) return
+    if (activeFocus && activeFocus.date === dayData.date && activeFocus.itemId === id) {
+      pauseActiveFocus(true)
+    }
     mutateItems(dayData.items.filter((i) => i.id !== id))
   }
 
@@ -396,7 +617,11 @@ export default function HomeClient() {
     mutateItems(dayData.items.map((i) => (i.id === id ? { ...i, notes, links } : i)))
   }
 
-  const [focusedItemId, setFocusedItemId] = useState<string | null>(null)
+  function updateItemProject(id: string, project: string) {
+    if (!dayData) return
+    const normalized = normalizeProjectName(project)
+    mutateItems(dayData.items.map((i) => (i.id === id ? { ...i, project: normalized || undefined } : i)))
+  }
 
   function addItem() {
     if (!dayData) return
@@ -414,6 +639,14 @@ export default function HomeClient() {
   // ── Context data ──
 
   const recentDays = getRecentDays(7, today)
+  const allDays = loadAllDays()
+  const projectNames = collectProjectNames(allDays)
+  const activeFocusItem = activeFocus ? loadDay(activeFocus.date)?.items.find((item) => item.id === activeFocus.itemId) ?? null : null
+  const activeFocusSeconds =
+    activeFocus && activeFocusItem
+      ? (activeFocusItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus, focusNow)
+      : 0
+  const selectedProjectEntries = selectedProject ? getProjectEntries(allDays, selectedProject) : []
   const recentlyDone = recentDays
     .flatMap((d) => d.items.filter((i) => i.status === "done").map((i) => ({ ...i, date: d.date })))
     .slice(0, 6)
@@ -454,6 +687,16 @@ export default function HomeClient() {
                 label="This Week"
                 items={weekItems}
                 onPromote={(id: string) => setPriority(id, "today")}
+              />
+            )}
+            {projectNames.length > 0 && (
+              <ProjectsDropdown
+                projects={projectNames}
+                activeProject={selectedProject}
+                onSelect={(project) => {
+                  setSelectedProject(project)
+                  setView("project")
+                }}
               />
             )}
           </div>
@@ -525,6 +768,23 @@ export default function HomeClient() {
           onSelect={setSelectedDate}
         />
 
+        {activeFocus && activeFocusItem && !focusedItemId && (
+          <ActiveFocusBar
+            item={activeFocusItem}
+            seconds={activeFocusSeconds}
+            onResume={() => {
+              setSelectedDate(activeFocus.date)
+              setView("triage")
+              setFocusedItemId(activeFocus.itemId)
+            }}
+            onPause={() => pauseActiveFocus()}
+            onOpenProject={(project) => {
+              setSelectedProject(project)
+              setView("project")
+            }}
+          />
+        )}
+
         {/* ── Brain Dump ── */}
         {view === "dump" && (
           <BrainDumpView
@@ -541,11 +801,36 @@ export default function HomeClient() {
           return focusedItem ? (
             <FocusView
               item={focusedItem}
+              projectOptions={projectNames}
+              activeSeconds={activeFocus && activeFocus.date === selectedDate && activeFocus.itemId === focusedItem.id
+                ? (focusedItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus, focusNow)
+                : focusedItem.focus_seconds ?? 0}
+              isActive={Boolean(activeFocus && activeFocus.date === selectedDate && activeFocus.itemId === focusedItem.id)}
               onToggleDone={(id) => { toggleDone(id); setTimeout(() => setFocusedItemId(null), 1200) }}
+              onUpdateDetail={(notes, links) => updateItemDetail(focusedItem.id, notes, links)}
+              onUpdateProject={(project) => updateItemProject(focusedItem.id, project)}
+              onPause={() => pauseActiveFocus(true)}
+              onOpenProject={(project) => {
+                setSelectedProject(project)
+                setView("project")
+              }}
               onExit={() => setFocusedItemId(null)}
             />
           ) : null
         })()}
+
+        {/* ── Project View ── */}
+        {view === "project" && selectedProject && (
+          <ProjectView
+            project={selectedProject}
+            entries={selectedProjectEntries}
+            onBack={() => setView(dayData ? "triage" : "dump")}
+            onOpenDay={(date) => {
+              setSelectedDate(date)
+              setView("triage")
+            }}
+          />
+        )}
 
         {/* ── Triage ── */}
         {view === "triage" && dayData && !focusedItemId && (
@@ -562,7 +847,13 @@ export default function HomeClient() {
               onEditingIdChange={setEditingId}
               onReDump={() => setView("dump")}
               onUpdateDetail={updateItemDetail}
-              onFocus={setFocusedItemId}
+              onUpdateProject={updateItemProject}
+              projectOptions={projectNames}
+              onFocus={startFocus}
+              onOpenProject={(project) => {
+                setSelectedProject(project)
+                setView("project")
+              }}
             />
             {(recentlyDone.length > 0 || stillActive.length > 0) && (
               <ContextPanel done={recentlyDone} active={stillActive} />
@@ -761,7 +1052,10 @@ function TriageView({
   onEditingIdChange,
   onReDump,
   onUpdateDetail,
+  onUpdateProject,
+  projectOptions,
   onFocus,
+  onOpenProject,
 }: {
   items: Item[]
   editingId: string | null
@@ -774,7 +1068,10 @@ function TriageView({
   onEditingIdChange: (id: string | null) => void
   onReDump: () => void
   onUpdateDetail: (id: string, notes: string, links: string[]) => void
+  onUpdateProject: (id: string, project: string) => void
+  projectOptions: string[]
   onFocus: (id: string) => void
+  onOpenProject: (project: string) => void
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const events = items.filter((i) => i.type === "event")
@@ -856,7 +1153,10 @@ function TriageView({
               onStopEdit={() => onEditingIdChange(null)}
               onExpandToggle={() => setExpandedId((prev) => (prev === item.id ? null : item.id))}
               onUpdateDetail={(notes, links) => onUpdateDetail(item.id, notes, links)}
+              onUpdateProject={(project) => onUpdateProject(item.id, project)}
+              projectOptions={projectOptions}
               onFocus={() => onFocus(item.id)}
+              onOpenProject={onOpenProject}
             />
           ))}
         </div>
@@ -887,7 +1187,10 @@ function TriageView({
               onStopEdit={() => onEditingIdChange(null)}
               onExpandToggle={() => setExpandedId((prev) => (prev === item.id ? null : item.id))}
               onUpdateDetail={(notes: string, links: string[]) => onUpdateDetail(item.id, notes, links)}
+              onUpdateProject={(project: string) => onUpdateProject(item.id, project)}
+              projectOptions={projectOptions}
               onFocus={() => onFocus(item.id)}
+              onOpenProject={onOpenProject}
             />
           ))}
         </div>
@@ -922,7 +1225,10 @@ function ItemCard({
   onStopEdit,
   onExpandToggle,
   onUpdateDetail,
+  onUpdateProject,
+  projectOptions,
   onFocus,
+  onOpenProject,
 }: {
   item: Item
   isEditing: boolean
@@ -935,10 +1241,12 @@ function ItemCard({
   onStopEdit: () => void
   onExpandToggle: () => void
   onUpdateDetail: (notes: string, links: string[]) => void
+  onUpdateProject: (project: string) => void
+  projectOptions: string[]
   onFocus: () => void
+  onOpenProject: (project: string) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
-  const [linkInput, setLinkInput] = useState("")
   const isDone = item.status === "done"
 
   useEffect(() => {
@@ -951,7 +1259,7 @@ function ItemCard({
   }, [isEditing])
 
   const isEvent = item.type === "event"
-  const hasDetail = !!(item.notes || (item.links && item.links.length > 0))
+  const hasDetail = !!(item.notes || (item.links && item.links.length > 0) || item.project)
 
   return (
     <div
@@ -999,19 +1307,36 @@ function ItemCard({
               style={{ color: "var(--foreground)" }}
             />
           ) : (
-            <span
-              className="text-sm leading-snug cursor-text"
-              style={{
-                color: "var(--foreground)",
-                textDecoration: isDone ? "line-through" : "none",
-                textDecorationColor: "rgba(120,113,108,0.5)",
-              }}
-              onClick={!isDone ? onStartEdit : undefined}
-            >
-              {item.text || (
-                <span style={{ color: "var(--text-muted)" }}>tap to edit</span>
+            <div>
+              <span
+                className="text-sm leading-snug cursor-text"
+                style={{
+                  color: "var(--foreground)",
+                  textDecoration: isDone ? "line-through" : "none",
+                  textDecorationColor: "rgba(120,113,108,0.5)",
+                }}
+                onClick={!isDone ? onStartEdit : undefined}
+              >
+                {item.text || (
+                  <span style={{ color: "var(--text-muted)" }}>tap to edit</span>
+                )}
+              </span>
+              {(item.project || item.focus_seconds) && (
+                <div className="flex flex-wrap items-center gap-2 mt-2">
+                  {item.project && (
+                    <ProjectBadge
+                      project={item.project}
+                      onClick={() => onOpenProject(item.project!)}
+                    />
+                  )}
+                  {(item.focus_seconds ?? 0) > 0 && (
+                    <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                      focused {formatDurationCompact(item.focus_seconds ?? 0)}
+                    </span>
+                  )}
+                </div>
               )}
-            </span>
+            </div>
           )}
         </div>
 
@@ -1060,7 +1385,7 @@ function ItemCard({
             className="ml-auto text-xs"
             style={{ color: "var(--text-muted)", opacity: hasDetail ? 0.8 : 0.35 }}
           >
-            {isExpanded ? "▾ notes" : hasDetail ? "▸ notes ·" : "▸ notes"}
+            {isExpanded ? "▾ resources" : hasDetail ? "▸ resources ·" : "▸ resources"}
           </button>
         </div>
       )}
@@ -1068,60 +1393,14 @@ function ItemCard({
       {/* Expanded detail panel */}
       {isExpanded && !isDone && (
         <div className="mt-3 pl-9 space-y-3">
-          <textarea
-            value={item.notes ?? ""}
-            onChange={(e) => onUpdateDetail(e.target.value, item.links ?? [])}
-            placeholder="notes..."
-            className="w-full text-xs resize-none outline-none rounded-lg"
-            style={{
-              minHeight: "60px",
-              background: "rgba(0,0,0,0.03)",
-              border: "1px solid var(--surface-border)",
-              padding: "8px 10px",
-              color: "var(--foreground)",
-            }}
+          <ResourceEditor
+            key={`${item.id}-${item.project ?? ""}`}
+            item={item}
+            projectOptions={projectOptions}
+            onUpdateDetail={onUpdateDetail}
+            onUpdateProject={onUpdateProject}
+            onOpenProject={onOpenProject}
           />
-          <div>
-            {(item.links ?? []).map((link, i) => (
-              <div key={i} className="flex items-center gap-2 mb-1.5">
-                <a
-                  href={link}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs flex-1 truncate"
-                  style={{ color: "#0369a1" }}
-                >
-                  {link}
-                </a>
-                <button
-                  onClick={() => onUpdateDetail(item.notes ?? "", (item.links ?? []).filter((_, j) => j !== i))}
-                  className="text-xs flex-shrink-0"
-                  style={{ color: "var(--text-muted)" }}
-                >
-                  ✕
-                </button>
-              </div>
-            ))}
-            <input
-              value={linkInput}
-              onChange={(e) => setLinkInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && linkInput.trim()) {
-                  const url = linkInput.trim().startsWith("http") ? linkInput.trim() : `https://${linkInput.trim()}`
-                  onUpdateDetail(item.notes ?? "", [...(item.links ?? []), url])
-                  setLinkInput("")
-                }
-              }}
-              placeholder="paste a link + enter"
-              className="w-full text-xs outline-none"
-              style={{
-                background: "transparent",
-                color: "var(--text-muted)",
-                borderBottom: "1px solid var(--surface-border)",
-                padding: "4px 0",
-              }}
-            />
-          </div>
         </div>
       )}
     </div>
@@ -1278,24 +1557,454 @@ function QueueDropdown({
   )
 }
 
+function ProjectBadge({
+  project,
+  onClick,
+}: {
+  project: string
+  onClick?: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-full"
+      style={{
+        background: "rgba(2,132,199,0.08)",
+        color: "#075985",
+        border: "1px solid rgba(2,132,199,0.14)",
+      }}
+    >
+      <span style={{ opacity: 0.7 }}>◈</span>
+      <span>{project}</span>
+    </button>
+  )
+}
+
+function ResourceEditor({
+  item,
+  projectOptions,
+  onUpdateDetail,
+  onUpdateProject,
+  onOpenProject,
+}: {
+  item: Item
+  projectOptions: string[]
+  onUpdateDetail: (notes: string, links: string[]) => void
+  onUpdateProject: (project: string) => void
+  onOpenProject?: (project: string) => void
+}) {
+  const [linkInput, setLinkInput] = useState("")
+  const [projectInput, setProjectInput] = useState(item.project ?? "")
+  const suggestions = inferProjectSuggestions(item, projectOptions)
+
+  function addLink() {
+    if (!linkInput.trim()) return
+    const url = linkInput.trim().startsWith("http") ? linkInput.trim() : `https://${linkInput.trim()}`
+    onUpdateDetail(item.notes ?? "", [...(item.links ?? []), url])
+    setLinkInput("")
+  }
+
+  function applyProject(value: string) {
+    const normalized = normalizeProjectName(value)
+    onUpdateProject(normalized)
+    setProjectInput(normalized)
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-[11px] font-bold tracking-widest uppercase mb-2" style={{ color: "var(--text-muted)" }}>
+          Resources
+        </p>
+        <textarea
+          value={item.notes ?? ""}
+          onChange={(e) => onUpdateDetail(e.target.value, item.links ?? [])}
+          placeholder="notes, context, next steps..."
+          className="w-full text-xs resize-none outline-none rounded-xl"
+          style={{
+            minHeight: "72px",
+            background: "rgba(0,0,0,0.03)",
+            border: "1px solid var(--surface-border)",
+            padding: "10px 12px",
+            color: "var(--foreground)",
+          }}
+        />
+      </div>
+
+      <div className="space-y-2">
+        {(item.links ?? []).map((link, i) => (
+          <div
+            key={i}
+            className="flex items-center gap-2 rounded-xl px-3 py-2"
+            style={{ background: "rgba(255,255,255,0.65)", border: "1px solid var(--surface-border)" }}
+          >
+            <a
+              href={link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs flex-1 truncate"
+              style={{ color: "#0369a1" }}
+            >
+              {link}
+            </a>
+            <button
+              onClick={() => onUpdateDetail(item.notes ?? "", (item.links ?? []).filter((_, j) => j !== i))}
+              className="text-xs flex-shrink-0"
+              style={{ color: "var(--text-muted)" }}
+            >
+              remove
+            </button>
+          </div>
+        ))}
+
+        <div className="flex gap-2">
+          <input
+            value={linkInput}
+            onChange={(e) => setLinkInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault()
+                addLink()
+              }
+            }}
+            placeholder="add link, doc, or page"
+            className="flex-1 text-xs outline-none rounded-xl px-3 py-2"
+            style={{
+              background: "rgba(255,255,255,0.65)",
+              border: "1px solid var(--surface-border)",
+              color: "var(--foreground)",
+            }}
+          />
+          <button className="ui-button ui-button--ghost text-xs" onClick={addLink}>
+            Add
+          </button>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <p className="text-[11px] font-bold tracking-widest uppercase" style={{ color: "var(--text-muted)" }}>
+          Project
+        </p>
+        {item.project && (
+          <div className="flex items-center gap-2">
+            <ProjectBadge
+              project={item.project}
+              onClick={onOpenProject ? () => onOpenProject(item.project!) : undefined}
+            />
+            <button
+              className="text-xs"
+              style={{ color: "var(--text-muted)" }}
+              onClick={() => applyProject("")}
+            >
+              clear
+            </button>
+          </div>
+        )}
+        <div className="flex gap-2">
+          <input
+            list={`project-options-${item.id}`}
+            value={projectInput}
+            onChange={(e) => setProjectInput(e.target.value)}
+            onBlur={() => {
+              if (projectInput !== (item.project ?? "")) applyProject(projectInput)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault()
+                applyProject(projectInput)
+              }
+            }}
+            placeholder="attach to a project"
+            className="flex-1 text-xs outline-none rounded-xl px-3 py-2"
+            style={{
+              background: "rgba(255,255,255,0.65)",
+              border: "1px solid var(--surface-border)",
+              color: "var(--foreground)",
+            }}
+          />
+          <datalist id={`project-options-${item.id}`}>
+            {projectOptions.map((project) => (
+              <option key={project} value={project} />
+            ))}
+          </datalist>
+          <button className="ui-button ui-button--ghost text-xs" onClick={() => applyProject(projectInput)}>
+            Save
+          </button>
+        </div>
+        {suggestions.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {suggestions.map((project) => (
+              <button
+                key={project}
+                className="text-xs px-2 py-1 rounded-full"
+                style={{
+                  background: "rgba(180,83,9,0.08)",
+                  color: "#92400e",
+                  border: "1px solid rgba(180,83,9,0.15)",
+                }}
+                onClick={() => applyProject(project)}
+              >
+                {project}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ProjectsDropdown({
+  projects,
+  activeProject,
+  onSelect,
+}: {
+  projects: string[]
+  activeProject: string | null
+  onSelect: (project: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener("mousedown", handleClick)
+    return () => document.removeEventListener("mousedown", handleClick)
+  }, [open])
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button
+        onClick={() => setOpen((value) => !value)}
+        className="flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full"
+        style={{
+          background: activeProject ? "rgba(2,132,199,0.1)" : "rgba(0,0,0,0.04)",
+          color: activeProject ? "#075985" : "var(--text-muted)",
+          transition: "background 150ms",
+        }}
+      >
+        Projects
+        <span className="font-bold tabular-nums hidden sm:inline">{projects.length}</span>
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 8px)",
+            left: 0,
+            width: "280px",
+            background: "rgba(247,246,242,0.98)",
+            backdropFilter: "blur(12px)",
+            border: "1px solid var(--surface-border)",
+            borderRadius: "12px",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.1)",
+            padding: "0.75rem",
+            zIndex: 100,
+          }}
+        >
+          <p className="text-xs font-bold tracking-widest uppercase mb-3" style={{ color: "var(--text-muted)" }}>
+            Projects
+          </p>
+          <div className="space-y-1">
+            {projects.map((project) => (
+              <button
+                key={project}
+                className="w-full flex items-center justify-between gap-3 py-2 px-2 rounded-lg text-left"
+                style={{
+                  background: activeProject === project ? "rgba(2,132,199,0.08)" : "transparent",
+                  color: "var(--foreground)",
+                }}
+                onClick={() => {
+                  onSelect(project)
+                  setOpen(false)
+                }}
+              >
+                <span className="text-sm">{project}</span>
+                <span className="text-xs" style={{ color: "var(--text-muted)" }}>open</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ActiveFocusBar({
+  item,
+  seconds,
+  onResume,
+  onPause,
+  onOpenProject,
+}: {
+  item: Item
+  seconds: number
+  onResume: () => void
+  onPause: () => void
+  onOpenProject: (project: string) => void
+}) {
+  return (
+    <div
+      className="mb-5 rounded-3xl px-4 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+      style={{
+        background: "linear-gradient(135deg, rgba(255,255,255,0.95), rgba(240,249,255,0.95))",
+        border: "1px solid rgba(2,132,199,0.12)",
+        boxShadow: "var(--shadow-soft)",
+      }}
+    >
+      <div className="min-w-0">
+        <p className="text-[11px] font-bold tracking-widest uppercase mb-1" style={{ color: "#0369a1" }}>
+          Active Focus
+        </p>
+        <p className="text-sm font-semibold truncate" style={{ color: "var(--foreground)" }}>
+          {item.text}
+        </p>
+        <div className="flex flex-wrap items-center gap-2 mt-2">
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            {formatDurationClock(seconds)} running
+          </span>
+          {item.project && (
+            <ProjectBadge project={item.project} onClick={() => onOpenProject(item.project!)} />
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <button className="ui-button ui-button--ghost text-xs" onClick={onPause}>
+          Pause
+        </button>
+        <button className="ui-button ui-button--primary text-xs" onClick={onResume}>
+          Resume Focus
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ProjectView({
+  project,
+  entries,
+  onBack,
+  onOpenDay,
+}: {
+  project: string
+  entries: ProjectEntry[]
+  onBack: () => void
+  onOpenDay: (date: string) => void
+}) {
+  const activeCount = entries.filter((entry) => entry.item.status === "active").length
+  const doneCount = entries.filter((entry) => entry.item.status === "done").length
+  const totalFocus = entries.reduce((sum, entry) => sum + (entry.item.focus_seconds ?? 0), 0)
+  const grouped = entries.reduce<Record<string, Item[]>>((acc, entry) => {
+    acc[entry.date] = [...(acc[entry.date] ?? []), entry.item]
+    return acc
+  }, {})
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <button className="ui-button ui-button--ghost text-xs mb-3" onClick={onBack}>
+            ← Back
+          </button>
+          <h1 className="text-3xl font-black mb-1" style={{ fontFamily: "var(--font-playfair)" }}>
+            {project}
+          </h1>
+          <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+            {activeCount} active · {doneCount} done · {formatDurationCompact(totalFocus)} focused
+          </p>
+        </div>
+      </div>
+
+      {entries.length === 0 ? (
+        <div className="app-card text-sm" style={{ color: "var(--text-muted)" }}>
+          Nothing tied to this project yet.
+        </div>
+      ) : (
+        Object.keys(grouped).sort((a, b) => b.localeCompare(a)).map((date) => (
+          <div key={date} className="space-y-2">
+            <button
+              className="text-xs font-bold tracking-widest uppercase"
+              style={{ color: "var(--text-muted)" }}
+              onClick={() => onOpenDay(date)}
+            >
+              {formatDisplayDate(date)}
+            </button>
+            <div className="space-y-2">
+              {grouped[date].map((item) => (
+                <div
+                  key={item.id}
+                  className="task-card px-4 py-3"
+                  style={{ opacity: item.status === "done" ? 0.6 : 1 }}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p
+                        className="text-sm leading-snug"
+                        style={{
+                          color: "var(--foreground)",
+                          textDecoration: item.status === "done" ? "line-through" : "none",
+                        }}
+                      >
+                        {item.text}
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2 mt-2">
+                        {item.type === "event" && (
+                          <span className="text-xs px-2 py-1 rounded-full" style={{ background: "rgba(56,189,248,0.1)", color: "#0369a1" }}>
+                            calendar
+                          </span>
+                        )}
+                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                          {item.status === "done" ? "done" : item.priority === "unassigned" ? "active" : item.priority}
+                        </span>
+                        {(item.focus_seconds ?? 0) > 0 && (
+                          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                            {formatDurationCompact(item.focus_seconds ?? 0)} focused
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
 // ─── Focus View ───────────────────────────────────────────────────────────────
 
 function FocusView({
   item,
+  projectOptions,
+  activeSeconds,
+  isActive,
   onToggleDone,
+  onUpdateDetail,
+  onUpdateProject,
+  onPause,
+  onOpenProject,
   onExit,
 }: {
   item: Item
+  projectOptions: string[]
+  activeSeconds: number
+  isActive: boolean
   onToggleDone: (id: string) => void
+  onUpdateDetail: (notes: string, links: string[]) => void
+  onUpdateProject: (project: string) => void
+  onPause: () => void
+  onOpenProject: (project: string) => void
   onExit: () => void
 }) {
-  const [seconds, setSeconds] = useState(0)
   const isDone = item.status === "done"
-
-  useEffect(() => {
-    const interval = setInterval(() => setSeconds((s) => s + 1), 1000)
-    return () => clearInterval(interval)
-  }, [])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -1305,59 +2014,88 @@ function FocusView({
     return () => document.removeEventListener("keydown", onKey)
   }, [onExit])
 
-  const mins = String(Math.floor(seconds / 60)).padStart(2, "0")
-  const secs = String(seconds % 60).padStart(2, "0")
-
   return (
     <div
-      className="flex flex-col items-center justify-center text-center"
-      style={{ minHeight: "calc(100vh - 57px)", padding: "2rem" }}
+      className="flex flex-col items-center text-center"
+      style={{ minHeight: "calc(100vh - 57px)", padding: "2rem 0 3rem" }}
     >
-      {/* Timer */}
-      <span
-        className="font-mono text-xs tracking-widest mb-10"
-        style={{ color: "var(--text-muted)", opacity: 0.5 }}
-      >
-        {mins}:{secs}
-      </span>
-
-      {/* Task text */}
-      <p
-        className="text-3xl font-black leading-snug max-w-sm mb-12"
+      <div
+        className="w-full max-w-xl rounded-[2rem] px-5 py-6 sm:px-8"
         style={{
-          fontFamily: "var(--font-playfair)",
-          color: isDone ? "var(--text-muted)" : "var(--foreground)",
-          textDecoration: isDone ? "line-through" : "none",
-          transition: "all 400ms ease",
+          background: "linear-gradient(180deg, rgba(255,255,255,0.96), rgba(255,255,255,0.84))",
+          border: "1px solid var(--surface-border)",
+          boxShadow: "var(--shadow-soft)",
         }}
       >
-        {item.text}
-      </p>
-
-      {/* Complete button */}
-      {!isDone ? (
-        <button
-          onClick={() => onToggleDone(item.id)}
-          className="w-14 h-14 rounded-full border-2 flex items-center justify-center transition-all"
-          style={{ borderColor: "var(--surface-border)" }}
-          aria-label="Mark done"
-        />
-      ) : (
-        <span className="text-sm" style={{ color: "#047857" }}>
-          Done ✓
-        </span>
-      )}
-
-      {/* Exit */}
-      {!isDone && (
-        <button
-          onClick={onExit}
-          className="mt-10 text-xs"
-          style={{ color: "var(--text-muted)", opacity: 0.35 }}
+        <span
+          className="font-mono text-xs tracking-widest"
+          style={{ color: "var(--text-muted)", opacity: 0.7 }}
         >
-          esc to exit
-        </button>
-      )}
+          {isActive ? "ACTIVE" : "PAUSED"} · {formatDurationClock(activeSeconds)}
+        </span>
+
+        <p
+          className="text-3xl font-black leading-snug max-w-md mx-auto mt-5 mb-4"
+          style={{
+            fontFamily: "var(--font-playfair)",
+            color: isDone ? "var(--text-muted)" : "var(--foreground)",
+            textDecoration: isDone ? "line-through" : "none",
+            transition: "all 400ms ease",
+          }}
+        >
+          {item.text}
+        </p>
+
+        <div className="flex flex-wrap items-center justify-center gap-2 mb-8">
+          {(item.focus_seconds ?? 0) > 0 && (
+            <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+              tracked {formatDurationCompact(item.focus_seconds ?? 0)} total
+            </span>
+          )}
+          {item.project && (
+            <ProjectBadge project={item.project} onClick={() => onOpenProject(item.project!)} />
+          )}
+        </div>
+
+        {!isDone ? (
+          <div className="flex items-center justify-center gap-3 mb-8">
+            <button
+              onClick={() => onToggleDone(item.id)}
+              className="w-14 h-14 rounded-full border-2 flex items-center justify-center transition-all"
+              style={{ borderColor: "var(--surface-border)" }}
+              aria-label="Mark done"
+            />
+            <button className="ui-button ui-button--ghost text-xs" onClick={onPause}>
+              Pause Timer
+            </button>
+          </div>
+        ) : (
+          <span className="text-sm" style={{ color: "#047857" }}>
+            Done ✓
+          </span>
+        )}
+
+        <div className="text-left mt-8">
+          <ResourceEditor
+            key={`${item.id}-${item.project ?? ""}`}
+            item={item}
+            projectOptions={projectOptions}
+            onUpdateDetail={onUpdateDetail}
+            onUpdateProject={onUpdateProject}
+            onOpenProject={onOpenProject}
+          />
+        </div>
+
+        {!isDone && (
+          <button
+            onClick={onExit}
+            className="mt-8 text-xs"
+            style={{ color: "var(--text-muted)", opacity: 0.5 }}
+          >
+            close focus view
+          </button>
+        )}
+      </div>
     </div>
   )
 }
