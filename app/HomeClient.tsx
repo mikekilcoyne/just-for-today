@@ -655,9 +655,16 @@ export default function HomeClient() {
     .flatMap((d) =>
       d.items.filter(
         (i) => i.status === "active" && (i.priority === "today" || i.priority === "week")
-      )
+      ).map((i) => ({ ...i, date: d.date }))
     )
     .slice(0, 5)
+
+  function mutateItemOnDate(date: string, itemId: string, mutator: (item: Item) => Item) {
+    mutateStoredDay(date, (data) => ({
+      ...data,
+      items: data.items.map((item) => (item.id === itemId ? mutator(item) : item)),
+    }))
+  }
 
   const weekItems = dayData?.items.filter((i) => i.type !== "event" && i.priority === "week" && i.status === "active") ?? []
   const laterItems = dayData?.items.filter((i) => i.type !== "event" && i.priority === "later" && i.status === "active") ?? []
@@ -856,7 +863,12 @@ export default function HomeClient() {
               }}
             />
             {(recentlyDone.length > 0 || stillActive.length > 0) && (
-              <ContextPanel done={recentlyDone} active={stillActive} />
+              <ContextPanel
+                done={recentlyDone}
+                active={stillActive}
+                onArchive={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, priority: "later" }))}
+                onComplete={(date, id) => mutateItemOnDate(date, id, (item) => ({ ...item, status: "done" }))}
+              />
             )}
           </>
         )}
@@ -1412,9 +1424,13 @@ function ItemCard({
 function ContextPanel({
   done,
   active,
+  onArchive,
+  onComplete,
 }: {
   done: (Item & { date: string })[]
-  active: Item[]
+  active: (Item & { date: string })[]
+  onArchive: (date: string, id: string) => void
+  onComplete: (date: string, id: string) => void
 }) {
   return (
     <div className="mt-12 space-y-7">
@@ -1458,11 +1474,41 @@ function ContextPanel({
           </p>
           <div className="space-y-1.5">
             {active.map((item) => (
-              <div key={item.id} className="flex items-center gap-2.5">
-                <span className="text-xs" style={{ color: "#0369a1" }}>→</span>
-                <span className="text-sm" style={{ color: "var(--text-muted)" }}>
-                  {item.text}
-                </span>
+              <div
+                key={item.id}
+                className="flex items-start gap-3 rounded-2xl px-3 py-3"
+                style={{ background: "rgba(255,255,255,0.55)", border: "1px solid var(--surface-border)" }}
+              >
+                <span className="text-xs mt-1" style={{ color: "#0369a1" }}>→</span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <span className="text-sm" style={{ color: "var(--text-muted)" }}>
+                      {item.text}
+                    </span>
+                    <span className="text-[11px]" style={{ color: "rgba(120,113,108,0.8)" }}>
+                      {formatDisplayDate(item.date)}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={{ background: "rgba(4,120,87,0.08)", color: "#047857" }}
+                      onClick={() => onComplete(item.date, item.id)}
+                    >
+                      check off
+                    </button>
+                    <button
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={{ background: "rgba(120,113,108,0.08)", color: "var(--text-muted)" }}
+                      onClick={() => onArchive(item.date, item.id)}
+                    >
+                      archive
+                    </button>
+                    {item.project && (
+                      <ProjectBadge project={item.project} />
+                    )}
+                  </div>
+                </div>
               </div>
             ))}
           </div>
