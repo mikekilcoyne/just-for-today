@@ -918,7 +918,7 @@ export default function HomeClient() {
                         return null
                       }
                     })
-                    .filter(Boolean)
+                    .filter((day): day is DayData => Boolean(day))
                   Promise.all(days.map((d) => pushDay(syncToken, d)))
                     .then(() => pushMeta(syncToken, meta))
                     .then(() => setSyncStatus("synced"))
