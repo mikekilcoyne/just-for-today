@@ -1642,44 +1642,45 @@ function ContextPanel({
             {active.map((item) => (
               <div
                 key={item.id}
-                className="flex items-start gap-3 rounded-2xl px-3 py-3"
-                style={{ background: "rgba(255,255,255,0.55)", border: "1px solid var(--surface-border)" }}
+                className="task-card px-4 py-3"
               >
-                <span className="text-xs mt-1" style={{ color: "#0369a1" }}>→</span>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap mb-1">
-                    <span className="text-sm" style={{ color: "var(--text-muted)" }}>
-                      {item.text}
-                    </span>
-                    <span className="text-[11px]" style={{ color: "rgba(120,113,108,0.8)" }}>
-                      {formatDisplayDate(item.date)}
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      className="text-xs px-2.5 py-1 rounded-full"
-                      style={{ background: "rgba(180,83,9,0.08)", color: "#b45309" }}
-                      onClick={() => onLater(item.date, item.id)}
-                    >
-                      later
-                    </button>
-                    <button
-                      className="text-xs px-2.5 py-1 rounded-full"
-                      style={{ background: "rgba(120,113,108,0.08)", color: "var(--text-muted)" }}
-                      onClick={() => onArchive(item.date, item.id)}
-                    >
-                      archive
-                    </button>
-                    <button
-                      className="text-xs px-2.5 py-1 rounded-full"
-                      style={{ background: "rgba(4,120,87,0.08)", color: "#047857" }}
-                      onClick={() => onComplete(item.date, item.id)}
-                    >
-                      check off
-                    </button>
-                    {item.project && (
-                      <ProjectBadge project={item.project} />
-                    )}
+                <div className="flex items-start gap-3">
+                  <span className="text-xs mt-0.5" style={{ color: "#0369a1" }}>→</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-2">
+                      <span className="text-sm leading-snug" style={{ color: "var(--foreground)" }}>
+                        {item.text}
+                      </span>
+                      <span className="text-[11px]" style={{ color: "rgba(120,113,108,0.8)" }}>
+                        {formatDisplayDate(item.date)}
+                      </span>
+                      {item.project && (
+                        <ProjectBadge project={item.project} />
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        className="ui-action-pill ui-action-pill--muted"
+                        onClick={() => onLater(item.date, item.id)}
+                      >
+                        Later
+                      </button>
+                      <button
+                        type="button"
+                        className="ui-action-pill ui-action-pill--archive"
+                        onClick={() => onArchive(item.date, item.id)}
+                      >
+                        Archive
+                      </button>
+                      <button
+                        type="button"
+                        className="ui-action-pill ui-action-pill--done"
+                        onClick={() => onComplete(item.date, item.id)}
+                      >
+                        Check Off
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
