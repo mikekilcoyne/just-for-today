@@ -53,6 +53,8 @@ interface FocusSession {
   date: string
   itemId: string
   startedAt: string
+  elapsedSeconds: number
+  lastTickedAt: string
 }
 
 interface ProjectEntry {
@@ -67,10 +69,23 @@ const META_KEY = "jft2-meta"
 const FOCUS_SESSION_KEY = "jft2-focus-session"
 const DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 const COMMON_PROJECTS = ["Just For Today", "Breakfast Clubbing", "YSJ site"]
+const FOCUS_MAX_TICK_GAP_MS = 90_000
+const FOCUS_IDLE_THRESHOLD_MS = 5 * 60_000
 const COMMON_PROJECT_ALIASES: Record<string, string[]> = {
   "Just For Today": ["just for today", "jft"],
   "Breakfast Clubbing": ["breakfast clubbing", "breakfast club"],
   "YSJ site": ["ysj site", "ysj"],
+}
+
+interface IdleDetectorLike extends EventTarget {
+  readonly userState: "active" | "idle" | null
+  readonly screenState: "locked" | "unlocked" | null
+  start(options?: { threshold?: number; signal?: AbortSignal }): Promise<void>
+}
+
+interface IdleDetectorStatic {
+  new (): IdleDetectorLike
+  requestPermission(): Promise<"granted" | "denied">
 }
 
 function makeId() {
@@ -211,10 +226,18 @@ function normalizeFocusSession(value: unknown): FocusSession | null {
   ) {
     return null
   }
+  const elapsedSeconds = typeof value.elapsedSeconds === "number" && Number.isFinite(value.elapsedSeconds)
+    ? Math.max(0, Math.floor(value.elapsedSeconds))
+    : 0
+  const lastTickedAt = typeof value.lastTickedAt === "string" && value.lastTickedAt
+    ? value.lastTickedAt
+    : value.startedAt
   return {
     date: value.date,
     itemId: value.itemId,
     startedAt: value.startedAt,
+    elapsedSeconds,
+    lastTickedAt,
   }
 }
 
@@ -362,8 +385,33 @@ function formatDurationClock(seconds: number) {
   return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
 }
 
-function getElapsedFocusSeconds(session: FocusSession, now = Date.now()) {
-  return Math.max(0, Math.floor((now - new Date(session.startedAt).getTime()) / 1000))
+function getIdleDetectorApi(): IdleDetectorStatic | null {
+  if (typeof window === "undefined") return null
+  const maybeIdleDetector = (window as Window & { IdleDetector?: IdleDetectorStatic }).IdleDetector
+  return typeof maybeIdleDetector === "function" ? maybeIdleDetector : null
+}
+
+function getFocusTimestamp(value: string, fallback = Date.now()) {
+  const timestamp = new Date(value).getTime()
+  return Number.isFinite(timestamp) ? timestamp : fallback
+}
+
+function getFocusGapMs(session: FocusSession, now = Date.now()) {
+  return Math.max(0, now - getFocusTimestamp(session.lastTickedAt, now))
+}
+
+function advanceFocusSession(session: FocusSession, now = Date.now()): FocusSession {
+  const gapMs = getFocusGapMs(session, now)
+  const addedSeconds = gapMs > FOCUS_MAX_TICK_GAP_MS ? 0 : Math.floor(gapMs / 1000)
+  return {
+    ...session,
+    elapsedSeconds: session.elapsedSeconds + Math.max(0, addedSeconds),
+    lastTickedAt: new Date(now).toISOString(),
+  }
+}
+
+function getElapsedFocusSeconds(session: FocusSession) {
+  return Math.max(0, session.elapsedSeconds)
 }
 
 function collectProjectNames(days: DayData[]) {
@@ -464,7 +512,7 @@ function parseBrainDump(text: string, anchorDate: string): {
     /^(\d{1,2}(?::\d{2})?\s*[-–—]\s*\d{1,2}(?::\d{2})?|\d{3,4}\s*[-–—])/.test(s) ||
     /(?:^|[\s(])\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s) ||
     /(?:^|[\s(])\d{3,4}\b/.test(s) ||
-    /\b\d{1,2}\s*o['’]?clock\b/i.test(s) ||
+    /\b\d{1,2}\s*o[‘’]?clock\b/i.test(s) ||
     /(?:@|at)\s*\d{1,2}(?::\d{2})?\b/i.test(s) ||
     /(?:@|at)\s*\d{3,4}\b/i.test(s)
   const weekStartDate = getWeekDays(anchorDate)[0]
@@ -520,7 +568,10 @@ function parseBrainDump(text: string, anchorDate: string): {
     }
     if (itemText.length < 2) continue
     if (isIntentionPhrase(itemText)) continue
-
+    if (looksLikeCalendarEvent(itemText)) {
+      items.push(makeItem(itemText, true))
+      continue
+    }
     items.push(makeItem(itemText, false))
   }
 
@@ -543,7 +594,11 @@ export default function HomeClient() {
   const [focusedItemId, setFocusedItemId] = useState<string | null>(null)
   const [selectedProject, setSelectedProject] = useState<string | null>(null)
   const [activeFocus, setActiveFocus] = useState<FocusSession | null>(() => loadFocusSession())
-  const [focusNow, setFocusNow] = useState(0)
+  const [idleDetectionPermission, setIdleDetectionPermission] = useState<"unknown" | "granted" | "denied" | "unsupported">(() =>
+    getIdleDetectorApi() ? "unknown" : "unsupported"
+  )
+  const activeFocusRef = useRef<FocusSession | null>(activeFocus)
+  const idlePermissionRequestedRef = useRef(false)
 
   // Load meta once
   useEffect(() => {
@@ -612,12 +667,58 @@ export default function HomeClient() {
   }, [activeFocus])
 
   useEffect(() => {
-    if (!activeFocus) return
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setFocusNow(Date.now())
-    const interval = setInterval(() => setFocusNow(Date.now()), 1000)
-    return () => clearInterval(interval)
+    activeFocusRef.current = activeFocus
   }, [activeFocus])
+
+  useEffect(() => {
+    if (!activeFocus) return
+    const tickFocus = () => {
+      const session = activeFocusRef.current
+      if (!session) return
+      const now = Date.now()
+      if (getFocusGapMs(session, now) > FOCUS_MAX_TICK_GAP_MS) {
+        finalizeFocusSession(session)
+        clearActiveFocus()
+        return
+      }
+      const advanced = advanceFocusSession(session, now)
+      activeFocusRef.current = advanced
+      setActiveFocus(advanced)
+    }
+
+    const interval = window.setInterval(tickFocus, 1000)
+    return () => window.clearInterval(interval)
+  }, [activeFocus?.date, activeFocus?.itemId, activeFocus])
+
+  useEffect(() => {
+    if (!activeFocus || idleDetectionPermission !== "granted") return
+    const IdleDetectorApi = getIdleDetectorApi()
+    if (!IdleDetectorApi) return
+
+    const abortController = new AbortController()
+    const detector = new IdleDetectorApi()
+    const pauseForIdle = () => {
+      const session = activeFocusRef.current
+      if (!session) return
+      finalizeFocusSession(session)
+      clearActiveFocus()
+    }
+
+    detector.addEventListener("change", pauseForIdle)
+    detector.start({
+      threshold: FOCUS_IDLE_THRESHOLD_MS,
+      signal: abortController.signal,
+    }).then(() => {
+      if (detector.userState === "idle" || detector.screenState === "locked") pauseForIdle()
+    }).catch(() => {
+      setIdleDetectionPermission("denied")
+    })
+
+    return () => {
+      abortController.abort()
+      detector.removeEventListener("change", pauseForIdle)
+    }
+  }, [activeFocus?.date, activeFocus?.itemId, activeFocus, idleDetectionPermission])
 
   // ── Brain dump submit ──
 
@@ -667,13 +768,14 @@ export default function HomeClient() {
 
   function finalizeFocusSession(session: FocusSession | null) {
     if (!session) return
-    const elapsed = getElapsedFocusSeconds(session)
+    const finalizedSession = advanceFocusSession(session)
+    const elapsed = getElapsedFocusSeconds(finalizedSession)
     if (elapsed <= 0) return
 
-    mutateStoredDay(session.date, (data) => {
+    mutateStoredDay(finalizedSession.date, (data) => {
       let changed = false
       const items = data.items.map((item) => {
-        if (item.id !== session.itemId) return item
+        if (item.id !== finalizedSession.itemId) return item
         changed = true
         return {
           ...item,
@@ -691,9 +793,26 @@ export default function HomeClient() {
   }
 
   function pauseActiveFocus(closeView = false) {
-    if (!activeFocus) return
-    finalizeFocusSession(activeFocus)
+    const session = activeFocusRef.current
+    if (!session) return
+    finalizeFocusSession(session)
     clearActiveFocus(closeView)
+  }
+
+  async function maybeEnableIdleDetection() {
+    const IdleDetectorApi = getIdleDetectorApi()
+    if (!IdleDetectorApi) {
+      setIdleDetectionPermission("unsupported")
+      return
+    }
+    if (idlePermissionRequestedRef.current) return
+    idlePermissionRequestedRef.current = true
+    try {
+      const permission = await IdleDetectorApi.requestPermission()
+      setIdleDetectionPermission(permission === "granted" ? "granted" : "denied")
+    } catch {
+      setIdleDetectionPermission("denied")
+    }
   }
 
   function startFocus(id: string) {
@@ -709,8 +828,11 @@ export default function HomeClient() {
       date: selectedDate,
       itemId: id,
       startedAt: new Date().toISOString(),
+      elapsedSeconds: 0,
+      lastTickedAt: new Date().toISOString(),
     })
     setFocusedItemId(id)
+    void maybeEnableIdleDetection()
   }
 
   function setPriority(id: string, priority: Priority) {
@@ -724,7 +846,7 @@ export default function HomeClient() {
     if (!item) return
     const newStatus: Item["status"] = item.status === "done" ? "active" : "done"
     const justFocused = activeFocus && activeFocus.date === dayData.date && activeFocus.itemId === id
-    const elapsed = justFocused ? getElapsedFocusSeconds(activeFocus) : 0
+    const elapsed = justFocused ? getElapsedFocusSeconds(advanceFocusSession(activeFocus)) : 0
     const updatedItems = dayData.items.map((i) =>
       i.id === id
         ? {
@@ -793,7 +915,7 @@ export default function HomeClient() {
   const activeFocusItem = activeFocus ? loadDay(activeFocus.date)?.items.find((item) => item.id === activeFocus.itemId) ?? null : null
   const activeFocusSeconds =
     activeFocus && activeFocusItem
-      ? (activeFocusItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus, focusNow)
+      ? (activeFocusItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus)
       : 0
   const selectedProjectEntries = selectedProject ? getProjectEntries(allDays, selectedProject) : []
   const recentlyDone = recentDays
@@ -973,13 +1095,19 @@ export default function HomeClient() {
               item={focusedItem}
               projectOptions={projectNames}
               activeSeconds={activeFocus && activeFocus.date === selectedDate && activeFocus.itemId === focusedItem.id
-                ? (focusedItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus, focusNow)
+                ? (focusedItem.focus_seconds ?? 0) + getElapsedFocusSeconds(activeFocus)
                 : focusedItem.focus_seconds ?? 0}
               isActive={Boolean(activeFocus && activeFocus.date === selectedDate && activeFocus.itemId === focusedItem.id)}
               onToggleDone={(id) => { toggleDone(id); setTimeout(() => setFocusedItemId(null), 1200) }}
               onUpdateDetail={(notes, links) => updateItemDetail(focusedItem.id, notes, links)}
               onUpdateProject={(project) => updateItemProject(focusedItem.id, project)}
-              onPause={() => pauseActiveFocus(true)}
+              onToggleFocus={() => {
+                if (activeFocus && activeFocus.date === selectedDate && activeFocus.itemId === focusedItem.id) {
+                  pauseActiveFocus()
+                  return
+                }
+                startFocus(focusedItem.id)
+              }}
               onOpenProject={(project) => {
                 setSelectedProject(project)
                 setView("project")
@@ -1540,8 +1668,8 @@ function ItemCard({
         </button>
       </div>
 
-      {/* Priority pills + expand toggle — tasks only, hidden when done */}
-      {!isDone && item.type !== "event" && (
+      {/* Priority pills + expand toggle — hidden when done */}
+      {!isDone && (
         <div className="flex items-center gap-2 mt-3 pl-9">
           {(["today", "week", "later"] as const).map((p) => {
             const isActive = item.priority === p
@@ -2216,7 +2344,7 @@ function FocusView({
   onToggleDone,
   onUpdateDetail,
   onUpdateProject,
-  onPause,
+  onToggleFocus,
   onOpenProject,
   onExit,
 }: {
@@ -2227,7 +2355,7 @@ function FocusView({
   onToggleDone: (id: string) => void
   onUpdateDetail: (notes: string, links: string[]) => void
   onUpdateProject: (project: string) => void
-  onPause: () => void
+  onToggleFocus: () => void
   onOpenProject: (project: string) => void
   onExit: () => void
 }) {
@@ -2292,8 +2420,8 @@ function FocusView({
               style={{ borderColor: "var(--surface-border)" }}
               aria-label="Mark done"
             />
-            <button className="ui-button ui-button--ghost text-xs" onClick={onPause}>
-              Pause Timer
+            <button className="ui-button ui-button--ghost text-xs" onClick={onToggleFocus}>
+              {isActive ? "Pause Timer" : "Resume Timer"}
             </button>
           </div>
         ) : (
