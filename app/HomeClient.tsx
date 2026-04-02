@@ -675,13 +675,7 @@ export default function HomeClient() {
     const tickFocus = () => {
       const session = activeFocusRef.current
       if (!session) return
-      const now = Date.now()
-      if (getFocusGapMs(session, now) > FOCUS_MAX_TICK_GAP_MS) {
-        finalizeFocusSession(session)
-        clearActiveFocus()
-        return
-      }
-      const advanced = advanceFocusSession(session, now)
+      const advanced = advanceFocusSession(session)
       activeFocusRef.current = advanced
       setActiveFocus(advanced)
     }
