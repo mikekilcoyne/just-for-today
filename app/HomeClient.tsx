@@ -510,7 +510,7 @@ function parseBrainDump(text: string, anchorDate: string): {
   const stripEventBullet = (s: string) => s.replace(/^[\s\u2022\u2023\u25E6\u2043\-*]+/, "").trim()
   const looksLikeCalendarEvent = (s: string) =>
     /^(\d{1,2}(?::\d{2})?\s*[-–—]\s*\d{1,2}(?::\d{2})?|\d{3,4}\s*[-–—])/.test(s) ||
-    /(?:^|[\s(])\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s) ||
+    /(?:^|[\s(])\d{1,4}(?::\d{2})?\s*(?:am|pm)\b/i.test(s) ||
     /(?:^|[\s(])\d{3,4}\b/.test(s) ||
     /\b\d{1,2}\s*o[‘’]?clock\b/i.test(s) ||
     /(?:@|at)\s*\d{1,2}(?::\d{2})?\b/i.test(s) ||
